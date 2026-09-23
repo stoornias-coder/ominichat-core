@@ -13,6 +13,10 @@ function buildSystemPrompt({ character, memories, session, webSearchResult }) {
       : `Aucun souvenir "${label}" pertinent pour l'instant.`;
 
   const isCharacterMode = Boolean(character.id);
+  // Un univers (character.id === null, comme l'assistant général) reste un
+  // mode "roleplay" : il doit garder les règles de cohérence de scène,
+  // contrairement à l'assistant général. Voir core/universe/universeManager.js.
+  const isRoleplayMode = isCharacterMode || Boolean(character.isUniverse);
 
   const searchBlock = webSearchResult
     ? `\n# RÉSULTATS DE RECHERCHE WEB (à utiliser si pertinent)\n${webSearchResult}\n`
@@ -30,7 +34,7 @@ function buildSystemPrompt({ character, memories, session, webSearchResult }) {
   // Règles génériques de cohérence en roleplay : s'appliquent à TOUS les
   // personnages, en plus de leurs règles propres ("rules"). Uniquement en
   // mode personnage (pas pour l'assistant général).
-  const genericCoherenceBlock = isCharacterMode
+  const genericCoherenceBlock = isRoleplayMode
     ? `
 # RÈGLES DE COHÉRENCE GÉNÉRIQUES (s'appliquent à tous les personnages)
 - Ne jamais transformer un événement déjà établi (ex: enlèvement, rupture, dispute, trahison) en un événement anodin, consenti ou différent après coup.
@@ -43,8 +47,14 @@ function buildSystemPrompt({ character, memories, session, webSearchResult }) {
 `
     : '';
 
+  const identityLine = character.isUniverse
+    ? `Tu es le Maître du Jeu de l'univers "${character.name}".`
+    : isCharacterMode
+      ? `Tu es ${character.name}${character.age ? `, ${character.age}` : ''}.`
+      : `Tu es ${character.name}, un assistant.`;
+
   return `# IDENTITÉ
-${isCharacterMode ? `Tu es ${character.name}${character.age ? `, ${character.age}` : ''}.` : `Tu es ${character.name}, un assistant.`}
+${identityLine}
 ${character.description || ''}
 ${roleBlock}${behaviorBlock}
 # PERSONNALITÉ
@@ -80,6 +90,7 @@ Après ta réponse normale à l'utilisateur, si (et seulement si) l'échange con
 ${MEMORY_DELIMITER}
 suivie d'un tableau JSON compact, sur une seule ligne, de la forme :
 [{"scope":"global|session${isCharacterMode ? '|character' : ''}","category":"fact|preference|relationship|event|personal|important","content":"résumé factuel à la 3e personne","importance":1-10}]
+${character.isUniverse ? '\nPour cet univers, utilise "session" (pas "character") pour tout ce qui concerne cette partie précise : c\'est le scope qui assure la continuité de la scène.\n' : ''}
 
 Règles de scope :
 - "global" : vrai sur l'utilisateur dans N'IMPORTE QUELLE conversation (ex: préférences générales, infos personnelles durables).
