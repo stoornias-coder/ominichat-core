@@ -15,11 +15,17 @@ router.get('/', async (req, res) => {
   res.json({ sessions, total, page, pageSize });
 });
 
-// POST /api/sessions { characterId?, title? } — nouvelle conversation.
+// POST /api/sessions { characterId?, universeId?, title? } — nouvelle conversation.
+// characterId et universeId sont mutuellement exclusifs (contrainte DB,
+// migration v6) : si les deux sont fournis, universeId est ignoré.
 router.post('/', async (req, res) => {
-  const { characterId = null, title } = req.body || {};
+  const { characterId = null, universeId = null, title } = req.body || {};
   try {
-    const session = await sessionManager.startNewSession(req.user, { characterId, title });
+    const session = await sessionManager.startNewSession(req.user, {
+      characterId,
+      universeId: characterId ? null : universeId,
+      title,
+    });
     res.status(201).json({ session });
   } catch (err) {
     logger.error('Erreur création session (web)', err);
