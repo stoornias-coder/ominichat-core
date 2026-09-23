@@ -20,6 +20,20 @@ async function resolveCharacterForSession(session) {
   return character || GENERAL_ASSISTANT;
 }
 
+// Comme resolveCharacterForSession, mais gère aussi le cas "univers" (voir
+// core/universe/universeManager.js) : une session est liée SOIT à un
+// personnage, SOIT à un univers, jamais les deux (contrainte DB, migration
+// v6). Utilisé par engine.js à la place de resolveCharacterForSession pour
+// que le moteur IA fonctionne pour les trois cas (assistant général,
+// personnage, univers) sans dupliquer sa logique.
+async function resolveEntityForSession(session) {
+  if (session.universe_id) {
+    const universeManager = require('../universe/universeManager');
+    return universeManager.resolveUniverseAsEntity(session.universe_id);
+  }
+  return resolveCharacterForSession(session);
+}
+
 async function listUserCharacters(user) {
   return db.listCharacters(user.id);
 }
@@ -38,6 +52,7 @@ async function archiveCharacter(characterId) {
 
 module.exports = {
   resolveCharacterForSession,
+  resolveEntityForSession,
   listUserCharacters,
   createCharacter,
   updateCharacter,
