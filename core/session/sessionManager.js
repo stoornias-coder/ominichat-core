@@ -8,8 +8,8 @@ async function getOrCreateActiveSession(user) {
   return db.createSession(user.id, { title: 'Discussion générale' });
 }
 
-async function startNewSession(user, { characterId = null, title } = {}) {
-  return db.createSession(user.id, { characterId, title });
+async function startNewSession(user, { characterId = null, universeId = null, title } = {}) {
+  return db.createSession(user.id, { characterId, universeId, title });
 }
 
 async function switchToSession(user, sessionId) {
@@ -49,6 +49,17 @@ async function startOrResumeCharacterSession(user, characterId) {
   return db.createSession(user.id, { characterId, title: character ? character.name : 'RP' });
 }
 
+// Équivalent de startOrResumeCharacterSession(), pour un univers.
+async function startOrResumeUniverseSession(user, universeId) {
+  const existing = await db.getLatestSessionForUniverse(user.id, universeId);
+  if (existing) {
+    await db.setActiveSession(user.id, existing.id);
+    return existing;
+  }
+  const universe = await db.getUniverse(universeId);
+  return db.createSession(user.id, { universeId, title: universe ? universe.name : 'Univers' });
+}
+
 module.exports = {
   getOrCreateActiveSession,
   startNewSession,
@@ -57,4 +68,5 @@ module.exports = {
   listUserSessionsPage,
   getSessionDetails,
   startOrResumeCharacterSession,
+  startOrResumeUniverseSession,
 };
