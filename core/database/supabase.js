@@ -162,16 +162,92 @@ async function createCharacter(userId, fields) {
 }
 
 // ============================================================
+// universes
+// ============================================================
+
+async function listUniverses(userId) {
+  const { data, error } = await supabase
+    .from('universes')
+    .select('id, name, description')
+    .eq('user_id', userId)
+    .eq('is_archived', false)
+    .order('created_at', { ascending: true });
+
+  if (error) {
+    logger.error('Erreur liste univers', error);
+    return [];
+  }
+  return data;
+}
+
+async function getUniverse(universeId) {
+  if (!universeId) return null;
+  const { data, error } = await supabase
+    .from('universes')
+    .select('*')
+    .eq('id', universeId)
+    .maybeSingle();
+
+  if (error) {
+    logger.error('Erreur lecture univers', error);
+    return null;
+  }
+  return data;
+}
+
+async function createUniverse(userId, fields) {
+  const { data, error } = await supabase
+    .from('universes')
+    .insert({ user_id: userId, ...fields })
+    .select()
+    .single();
+
+  if (error) {
+    logger.error('Erreur création univers', error);
+    throw error;
+  }
+  return data;
+}
+
+async function updateUniverse(universeId, fields) {
+  const { data, error } = await supabase
+    .from('universes')
+    .update(fields)
+    .eq('id', universeId)
+    .select()
+    .single();
+
+  if (error) {
+    logger.error('Erreur mise à jour univers', error);
+    throw error;
+  }
+  return data;
+}
+
+async function archiveUniverse(universeId) {
+  const { error } = await supabase
+    .from('universes')
+    .update({ is_archived: true })
+    .eq('id', universeId);
+
+  if (error) {
+    logger.error('Erreur archivage univers', error);
+    throw error;
+  }
+}
+
+// ============================================================
 // sessions
 // ============================================================
 
-async function createSession(userId, { characterId = null, title } = {}) {
+async function createSession(userId, { characterId = null, universeId = null, title } = {}) {
   const { data, error } = await supabase
     .from('sessions')
     .insert({
       user_id: userId,
       character_id: characterId,
-      title: title || (characterId ? 'RP' : 'Discussion générale'),
+      universe_id: universeId,
+      title: title || (characterId || universeId ? 'RP' : 'Discussion générale'),
     })
     .select()
     .single();
@@ -188,7 +264,7 @@ async function createSession(userId, { characterId = null, title } = {}) {
 async function listSessions(userId, limit = 20) {
   const { data, error } = await supabase
     .from('sessions')
-    .select('id, title, character_id, updated_at, characters(name)')
+    .select('id, title, character_id, universe_id, updated_at, characters(name), universes(name)')
     .eq('user_id', userId)
     .order('updated_at', { ascending: false })
     .limit(limit);
@@ -205,7 +281,7 @@ async function listSessions(userId, limit = 20) {
 async function listSessionsPage(userId, { limit = 5, offset = 0 } = {}) {
   const { data, error, count } = await supabase
     .from('sessions')
-    .select('id, title, character_id, updated_at, characters(name)', { count: 'exact' })
+    .select('id, title, character_id, universe_id, updated_at, characters(name), universes(name)', { count: 'exact' })
     .eq('user_id', userId)
     .order('updated_at', { ascending: false })
     .range(offset, offset + limit - 1);
@@ -220,12 +296,12 @@ async function listSessionsPage(userId, { limit = 5, offset = 0 } = {}) {
 async function getSessionWithCharacter(sessionId) {
   const { data, error } = await supabase
     .from('sessions')
-    .select('*, characters(name)')
+    .select('*, characters(name), universes(name)')
     .eq('id', sessionId)
     .maybeSingle();
 
   if (error) {
-    logger.error('Erreur lecture session (avec personnage)', error);
+    logger.error('Erreur lecture session (avec personnage/univers)', error);
     return null;
   }
   return data;
@@ -243,6 +319,23 @@ async function getLatestSessionForCharacter(userId, characterId) {
 
   if (error) {
     logger.error('Erreur recherche session existante pour personnage', error);
+    return null;
+  }
+  return data;
+}
+
+async function getLatestSessionForUniverse(userId, universeId) {
+  const { data, error } = await supabase
+    .from('sessions')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('universe_id', universeId)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    logger.error('Erreur recherche session existante pour univers', error);
     return null;
   }
   return data;
@@ -466,12 +559,18 @@ module.exports = {
   createCharacter,
   updateCharacter,
   archiveCharacter,
+  listUniverses,
+  getUniverse,
+  createUniverse,
+  updateUniverse,
+  archiveUniverse,
   createSession,
   listSessions,
   listSessionsPage,
   getSession,
   getSessionWithCharacter,
   getLatestSessionForCharacter,
+  getLatestSessionForUniverse,
   getActiveSession,
   saveMessage,
   getRecentMessages,
