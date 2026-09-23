@@ -1,0 +1,29 @@
+{
+  "name": "telegram-ai-character",
+  "version": "0.2.0",
+  "description": "Moteur généraliste IA sur Telegram : sessions multiples, personnages configurables, mémoire à 3 niveaux",
+  "main": "interfaces/telegram/index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node interfaces/telegram/index.js",
+    "start:telegram": "node interfaces/telegram/index.js",
+    "start:web": "node interfaces/web/server/index.js",
+    "telegram:set-webhook": "node scripts/setTelegramWebhook.js",
+    "telegram:delete-webhook": "node scripts/deleteTelegramWebhook.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "@supabase/supabase-js": "^2.45.4",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^2.7.0",
+    "ws": "^8.18.0",
+    "express": "^4.21.1",
+    "cors": "^2.8.5"
+  },
+  "overrides": {
+    "form-data": "^4.0.0"
+  }
+}
