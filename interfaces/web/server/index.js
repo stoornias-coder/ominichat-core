@@ -6,6 +6,7 @@ const logger = require('../../../core/utils/logger');
 const authRoutes = require('./routes/auth');
 const sessionRoutes = require('./routes/sessions');
 const characterRoutes = require('./routes/characters');
+const universeRoutes = require('./routes/universes');
 const telegramWebhookRoutes = require('./routes/telegramWebhook');
 
 const REQUIRED_ENV = [
@@ -52,6 +53,7 @@ function buildApp() {
   app.use('/api/auth', authRoutes);
   app.use('/api/sessions', sessionRoutes);
   app.use('/api/characters', characterRoutes);
+  app.use('/api/universes', universeRoutes);
 
   // Telegram (interface secondaire, optionnelle) : monté seulement si un
   // token ET un secret de chemin sont configurés. Le secret fait partie de
