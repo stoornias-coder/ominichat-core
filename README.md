@@ -179,7 +179,30 @@ chercher, le modèle ne « prétend » jamais avoir Internet.
 | `WEB_SEARCH_MAX_TOTAL` | `8` | Sources conservées au total. |
 | `WEB_PROMPT_MAX_CHARS` / `WEB_PROMPT_EXCERPT_CHARS` | `4500` / `600` | Budget du bloc web dans le prompt (protège les quotas de tokens). |
 
-Tests hors-ligne (Tavily simulé, aucune clé requise) : `node --test "core/search/*.test.js"`.
+### Recherche pour l'app OmniChat (`POST /api/search`)
+
+L'app OmniChat (frontend) garde son propre chat, mais délègue sa recherche
+« normale » à ce backend (le chemin RP spécialisé de l'app reste local).
+
+- Requête : `POST /api/search` avec `{ text, rewritten?, contextHint? }` et
+  l'en-tête **`X-Tavily-Key`** (la clé Tavily de l'utilisateur, jamais journalisée).
+- Réponse : `{ ok, text, sources, results, queries, meta, error }`. `text` est un
+  bloc prêt à insérer dans un prompt, sans titre de niveau 1.
+- **Pas de login** : la route est protégée par la clé de l'appelant et un limiteur
+  (`middleware/searchGuard.js`) : 20 requêtes / minute / IP, et blocage 15 min après
+  5 clés refusées par Tavily (anti test de clés volées).
+- Si le backend est injoignable, endormi (offre gratuite Render) ou refuse la
+  requête, l'app retombe sur son ancien moteur local : rien ne casse.
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `ALLOWED_ORIGINS` | vide | Doit contenir l'origine de l'app, ex. `https://stoornias-coder.github.io` (sans chemin). Sans ça, le navigateur bloque l'appel (CORS) et l'app utilise son repli. |
+| `SEARCH_RATE_LIMIT_PER_MIN` | `20` | Requêtes par minute et par IP. |
+| `SEARCH_MAX_INVALID_KEYS` | `5` | Clés refusées par Tavily avant blocage (15 min). |
+| `TRUST_PROXY_HOPS` | `1` | Proxys de confiance devant l'app, pour lire l'IP réelle du client. |
+
+Tests hors-ligne (Tavily simulé, aucune clé requise) :
+`node --test "core/**/*.test.js" "interfaces/**/*.test.js"`.
 
 ## 10. Interface Web (`interfaces/web/server`)
 

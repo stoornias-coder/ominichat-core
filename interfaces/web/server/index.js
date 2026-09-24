@@ -7,6 +7,7 @@ const authRoutes = require('./routes/auth');
 const sessionRoutes = require('./routes/sessions');
 const characterRoutes = require('./routes/characters');
 const universeRoutes = require('./routes/universes');
+const searchRoutes = require('./routes/search');
 const telegramWebhookRoutes = require('./routes/telegramWebhook');
 
 const REQUIRED_ENV = [
@@ -28,6 +29,12 @@ function checkEnv() {
 
 function buildApp() {
   const app = express();
+
+  // Derrière le proxy de l'hébergeur (Render…), req.ip doit être l'IP du client réel
+  // et non celle du proxy : nécessaire au limiteur de /api/search.
+  // TRUST_PROXY_HOPS = nombre de proxys de confiance devant l'app (1 par défaut ; 0 = aucun).
+  const trustProxyHops = parseInt(process.env.TRUST_PROXY_HOPS || '1', 10);
+  app.set('trust proxy', Number.isFinite(trustProxyHops) ? Math.max(0, trustProxyHops) : 1);
 
   // Autorise uniquement les origines listées (front Capacitor/web à venir).
   // Vide par défaut = aucune origine cross-site autorisée tant que le
@@ -54,6 +61,8 @@ function buildApp() {
   app.use('/api/sessions', sessionRoutes);
   app.use('/api/characters', characterRoutes);
   app.use('/api/universes', universeRoutes);
+  // Recherche web pour l'app OmniChat (protégée par la clé Tavily de l'appelant, pas par login).
+  app.use('/api/search', searchRoutes);
 
   // Telegram (interface secondaire, optionnelle) : monté seulement si un
   // token ET un secret de chemin sont configurés. Le secret fait partie de
