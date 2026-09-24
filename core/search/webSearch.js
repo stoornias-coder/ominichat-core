@@ -762,6 +762,23 @@ function registerOfficialEndpoint(entry) {
  * Sans cette variable d'env sur Render, cette fonction rend simplement null
  * et le comportement redevient celui d'avant (Tavily seul).
  */
+// Catégorisation légère des modèles Groq à partir de leur id, pour permettre
+// au prompt de distinguer "tous les modèles exposés" de "LLM utilisables pour
+// du chat" sans jamais dépendre d'une liste tierce (Tavily, doc marketing...).
+// Purement dérivé de l'id renvoyé par l'API elle-même : aucune fusion de source.
+function classifyGroqModelId(id) {
+  const s = String(id || '').toLowerCase();
+  if (/whisper|distil-whisper|tts|speech|orpheus|playai/.test(s)) return 'audio';
+  if (/guard|moderation|safety/.test(s)) return 'safety';
+  return 'llm'; // par défaut : génération de texte / usage conversationnel
+}
+
+const GROQ_CATEGORY_LABELS = {
+  llm: 'Modèles de génération de texte / LLM (utilisables pour du chat)',
+  audio: 'Modèles audio / transcription / voix',
+  safety: 'Modèles de sécurité / modération (garde-fous, pas des LLM de chat)',
+};
+
 async function fetchGroqModelsList(ctx) {
   const apiKey = String(process.env.GROQ_API_KEY || '').trim();
   if (!apiKey) {
@@ -779,18 +796,32 @@ async function fetchGroqModelsList(ctx) {
     const json = await res.json();
     const models = Array.isArray(json.data) ? json.data : [];
     if (!models.length) return null;
-    const lines = models.map((m) => {
+
+    const formatLine = (m) => {
       const bits = [m.id];
       if (m.owned_by) bits.push(`par ${m.owned_by}`);
       if (m.context_window) bits.push(`contexte ${m.context_window} tokens`);
       if (m.active === false) bits.push('[INACTIF]');
       return `- ${bits.join(' — ')}`;
-    }).join('\n');
+    };
+
+    // Regroupement par catégorie déduite de l'id — jamais d'ajout d'un modèle
+    // qui ne serait pas dans `models` (donc jamais d'ajout venant d'ailleurs).
+    const byCategory = { llm: [], audio: [], safety: [] };
+    for (const m of models) byCategory[classifyGroqModelId(m.id)].push(m);
+
+    const sections = ['llm', 'audio', 'safety']
+      .filter((cat) => byCategory[cat].length)
+      .map((cat) => `${GROQ_CATEGORY_LABELS[cat]} :\n${byCategory[cat].map(formatLine).join('\n')}`)
+      .join('\n\n');
+
+    const allIds = models.map((m) => `\`${m.id}\``).join(', ');
+
     return {
       title: 'Modèles Groq — liste officielle en direct (API)',
       url: 'https://console.groq.com/docs/models',
       domain: 'api.groq.com',
-      content: `Liste obtenue en temps réel via GET https://api.groq.com/openai/v1/models (source faisant autorité, pas une page web indexée) :\n${lines}\n\nUn modèle absent de cette liste n'est plus proposé par l'API Groq, même s'il apparaît encore dans d'anciens articles ou comparatifs.`,
+      content: `LISTE CANONIQUE, complète et exhaustive obtenue en temps réel via GET https://api.groq.com/openai/v1/models (source faisant autorité, pas une page web indexée). Cette liste contient EXACTEMENT ${models.length} modèle(s), regroupés par catégorie :\n\n${sections}\n\nRécapitulatif brut de tous les id renvoyés par l'API (rien d'autre n'existe actuellement côté Groq) : ${allIds}\n\nUn modèle absent de cette liste n'est plus proposé par l'API Groq, même s'il apparaît encore dans d'anciens articles, comparatifs ou pages officielles non mises à jour — ne le mentionne alors qu'au passé, comme un modèle déprécié/retiré, jamais comme actuellement disponible.`,
       publishedAt: ctx.now.toISOString(),
     };
   } catch (e) {
@@ -803,7 +834,7 @@ async function fetchGroqModelsList(ctx) {
 
 registerOfficialEndpoint({
   id: 'groq-models',
-  test: (text) => /\bgroq\b/i.test(text) && /\b(mod[eè]les?|models?|liste|d[eé]pr[eé]ci[eé]?s?|deprecat|retir[eé]s?|tool[-\s]?use|function[-\s]?calling)\b/i.test(text),
+  test: (text) => /\bgroq\b/i.test(text) && /\b(mod[eè]les?|models?|liste|d[eé]pr[eé]ci[eé]?s?|deprecat|retir[eé]s?|tool[-\s]?use|function[-\s]?calling|llms?|chatbot|conversationnel(?:le)?s?|mod[eè]le[s]?\s+de\s+langage)\b/i.test(text),
   fetcher: fetchGroqModelsList,
 });
 
@@ -1008,4 +1039,5 @@ module.exports = {
   isVagueQuery,
   _internal: { redact, normalizeUrl, degradePayload, buildPayload, processResults, INTENT_RULES, OFFICIAL_SOURCES },
 };
+
 
