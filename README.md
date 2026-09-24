@@ -23,7 +23,7 @@ telegram-ai-character/
 │   ├── session/sessionManager.js  ← créer/lister/activer une conversation
 │   ├── character/characterManager.js
 │   ├── memory/memoryManager.js    ← sélection pertinente : global / session / character
-│   ├── search/webSearch.js        ← heuristique + exécution (Tavily)
+│   ├── search/webSearch.js        ← détection par règles + recherche Tavily structurée (sources, dates, fiabilité)
 │   ├── ai/
 │   │   ├── router.js              ← generateAIResponse() — point d'entrée UNIQUE vers un provider
 │   │   ├── promptBuilder.js       ← construit le prompt + extrait la mémoire
@@ -135,13 +135,51 @@ sa propre réponse, un bloc technique invisible pour l'utilisateur
 
 ## 9. Recherche Internet
 
-Séparée du modèle (`core/search/webSearch.js`) :
-- `needsWebSearch()` : heuristique par mots-clés, gratuite, sans appel API.
-- `performWebSearch()` : **branchée sur Tavily** (free tier). Nécessite
-  `TAVILY_API_KEY` dans `.env` (https://tavily.com → compte gratuit → API
-  key). Sans clé, ou en cas d'échec/timeout de l'appel, la fonction renvoie
-  simplement `null` : la réponse continue normalement, sans bloquer, et le
-  modèle reste sur la consigne "dis-le honnêtement plutôt que d'inventer".
+Séparée du modèle (`core/search/webSearch.js`). Le backend décide s'il faut
+chercher, le modèle ne « prétend » jamais avoir Internet.
+
+**Fonctionnement**
+- **Détection par règles** (`needsWebSearch()` / `resolveWebIntent()`), gratuite,
+  sans appel API : recherche forcée, jamais (salutations, messages personnels),
+  identité / œuvres / entités connues, déclencheurs automatiques (actualité,
+  prix, versions…). Extensible : `registerRule()`.
+- **Requête optimisée** : nettoyage du message, découpage des questions
+  multiples en sous-recherches (3 max), `topic` / `time_range` selon le sujet.
+- **Sources officielles** : catalogue « sujet → domaines officiels »
+  (`registerOfficialSource()`), transmis à Tavily via `include_domains` en mode
+  `prefer`. Résultats dédoublonnés, filtrés puis classés :
+  officiel > institutionnel > média reconnu > référence > autre > forum.
+- **Retour structuré** (`searchWeb()`) : `results` (titre, URL, domaine, date de
+  publication, fraîcheur, type de source, extrait), `sources` (version allégée
+  pour une interface), `queries`, `rejected`, `meta`. Ne lève jamais d'exception.
+- `core/engine.js` renvoie en plus `sources` et `webSearch` (résumé technique)
+  dans le résultat de `processMessage()` ; les champs existants sont inchangés.
+- `core/ai/promptBuilder.js` injecte un bloc « RÉSULTATS DE RECHERCHE WEB » avec
+  une section par source et des règles d'usage : ne pas mélanger web et
+  connaissances internes, signaler les dates et les contradictions, pouvoir
+  répondre « je n'ai pas trouvé de source fiable ». Les extraits sont traités
+  comme des données (jamais comme des instructions).
+- Sans clé, ou en cas d'échec / timeout, la réponse du personnage part quand même.
+
+**Variables `.env`** (toutes optionnelles sauf la clé)
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `TAVILY_API_KEY` | — | Clé Tavily (https://tavily.com, free tier). Sans clé : pas de recherche. |
+| `WEB_SEARCH_MODE` | `auto` | `off` = recherche désactivée ; `web` = toujours chercher. |
+| `WEB_SEARCH_ENGINE` | `v2` | `legacy` = ancien moteur (`webSearch.legacy.js`), retour arrière immédiat. |
+| `WEB_SEARCH_DEBUG` | `1` hors production | Logs détaillés (déclenchement, requêtes, domaines, rejets, durée). Jamais de clé. |
+| `TAVILY_MAX_RESULTS` | `5` | Résultats par requête (1–20). |
+| `TAVILY_SEARCH_DEPTH` | `basic` | `basic`, `advanced` (2 crédits), `fast`, `ultra-fast`. |
+| `TAVILY_TOPIC` | `auto` | `auto` (choisi selon la question), `general`, `news`, `finance`. |
+| `TAVILY_INCLUDE_RAW_CONTENT` | `false` | `false`, `markdown` ou `text`. |
+| `TAVILY_INCLUDE_ANSWER` | `false` | Résumé généré par Tavily (sans source) : désactivé par défaut. |
+| `TAVILY_TIMEOUT_MS` | `8000` | Timeout par requête. |
+| `WEB_SEARCH_MAX_SUBQUERIES` | `3` | Sous-recherches max par message (1 crédit Tavily chacune en `basic`). |
+| `WEB_SEARCH_MAX_TOTAL` | `8` | Sources conservées au total. |
+| `WEB_PROMPT_MAX_CHARS` / `WEB_PROMPT_EXCERPT_CHARS` | `4500` / `600` | Budget du bloc web dans le prompt (protège les quotas de tokens). |
+
+Tests hors-ligne (Tavily simulé, aucune clé requise) : `node --test "core/search/*.test.js"`.
 
 ## 10. Interface Web (`interfaces/web/server`)
 
@@ -268,6 +306,6 @@ même conteneur, aucune réécriture de `core/` ou `interfaces/`.
 - [ ] `/sessions` liste, pagine, et "Reprendre cette conversation" réactive la bonne session
 - [ ] `/characters` → créer un personnage (flux guidé champ par champ), le modifier, l'archiver
 - [ ] Une information donnée dans un message est bien mémorisée puis rappelée dans un message suivant (scope session/character/global selon le cas)
-- [ ] Un message contenant un mot-clé de `SEARCH_TRIGGER_KEYWORDS` (ex: "météo à Paris aujourd'hui") déclenche un appel Tavily si `TAVILY_API_KEY` est renseignée, et la réponse reste correcte même sans clé
+- [ ] Un message qui demande une info d'actualité ou technique (ex: "météo à Paris aujourd'hui", "quels modèles Groq sont disponibles ?") déclenche un appel Tavily si `TAVILY_API_KEY` est renseignée (avec `WEB_SEARCH_DEBUG=1`, les logs montrent la requête, les domaines retenus/rejetés), et la réponse reste correcte même sans clé
 - [ ] Couper le provider IA principal (mauvaise clé) déclenche bien le fallback vers `AI_PROVIDER_FALLBACK`
 - [ ] Un message vide, ou une erreur interne provoquée volontairement, renvoie le message de fallback `"Attends, j'ai eu un petit bug 😅..."` sans crasher le process
