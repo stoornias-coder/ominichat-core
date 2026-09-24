@@ -196,6 +196,12 @@ const COMMUNITY_DOMAINS = [
 ];
 const SOURCE_RANK = { official: 0, institutional: 1, media: 2, reference: 3, other: 4, community: 5 };
 
+// Au sein même des domaines "officiels", certains sous-domaines sont la doc/API
+// technique (à jour, faisant autorité) plutôt que la vitrine marketing générale
+// (souvent moins précise ou plus lente à être mise à jour). Ces domaines sont
+// classés avant les autres domaines officiels du même fournisseur, à score égal.
+const PREFERRED_OFFICIAL_DOMAINS = ['console.groq.com', 'docs.mistral.ai', 'platform.openai.com', 'docs.claude.com', 'ai.google.dev'];
+
 const domainMatches = (host, domain) => host === domain || host.endsWith('.' + domain);
 
 function classifySource(domain) {
@@ -629,6 +635,8 @@ function normalizeResult(r, item, cfg, now) {
     freshness: freshnessLabel(ageDays),
     favicon: typeof r.favicon === 'string' && /^https?:\/\//i.test(r.favicon) ? r.favicon : null,
     sourceType: classifySource(domain),
+    preferred: PREFERRED_OFFICIAL_DOMAINS.some((d) => domainMatches(domain, d)),
+    authoritative: false,
     queryIds: [item.id],
     suspicious: INJECTION_RX.test(content) || (rawContent ? INJECTION_RX.test(rawContent) : false),
   };
@@ -641,7 +649,10 @@ function overlapsQuery(result, kws) {
 }
 
 const byRankThenScore = (a, b) =>
-  SOURCE_RANK[a.sourceType] - SOURCE_RANK[b.sourceType] || (b.score ?? 0) - (a.score ?? 0);
+  Number(!!b.authoritative) - Number(!!a.authoritative) ||
+  SOURCE_RANK[a.sourceType] - SOURCE_RANK[b.sourceType] ||
+  Number(!!b.preferred) - Number(!!a.preferred) ||
+  (b.score ?? 0) - (a.score ?? 0);
 
 /** Fusionne, dédoublonne, filtre, classe. Retourne { kept, rejected }. */
 function processResults(perQuery, plan, cfg) {
@@ -717,6 +728,84 @@ function processResults(perQuery, plan, cfg) {
   out.forEach((r, i) => { r.id = 'S' + (i + 1); });
   return { kept: out, rejected };
 }
+
+// ───────────────────────── 8bis. Endpoints officiels vérifiés ───────────────
+//
+// Pour certains faits à très haut risque d'hallucination (ex. "quels modèles
+// sont disponibles chez X ?"), une recherche Tavily classique renvoie des
+// pages web indexées — jamais garanties à jour, et souvent moins précises que
+// des benchmarks tiers obsolètes qui, eux, listent beaucoup de détails
+// (d'où le risque que le modèle s'appuie dessus). Ici, on interroge l'API
+// officielle DIRECTEMENT, et on injecte le résultat comme source faisant
+// autorité absolue (authoritative:true), toujours en tête, jamais évincée
+// par le plafond de résultats.
+//
+// Best-effort et silencieux : si la clé serveur nécessaire est absente ou si
+// l'appel échoue, on ne fait AUCUNE différence visible — le pipeline Tavily
+// habituel prend le relais normalement. Aucune exception ne remonte jamais.
+
+const OFFICIAL_ENDPOINTS = [];
+
+function registerOfficialEndpoint(entry) {
+  if (!entry || typeof entry.id !== 'string' || typeof entry.test !== 'function' || typeof entry.fetcher !== 'function') {
+    throw new Error('registerOfficialEndpoint: { id, test(text)=>boolean, fetcher(ctx)=>Promise<Result|null> } requis');
+  }
+  const i = OFFICIAL_ENDPOINTS.findIndex((e) => e.id === entry.id);
+  if (i >= 0) OFFICIAL_ENDPOINTS[i] = entry; else OFFICIAL_ENDPOINTS.push(entry);
+}
+
+/**
+ * Liste en direct des modèles Groq — GET /openai/v1/models (doc Tavily non
+ * concernée ici, c'est l'API OpenAI-compatible de Groq elle-même).
+ * Nécessite une clé serveur GROQ_API_KEY (indépendante de la clé Tavily et
+ * de la clé Groq personnelle de l'utilisateur, saisie côté navigateur).
+ * Sans cette variable d'env sur Render, cette fonction rend simplement null
+ * et le comportement redevient celui d'avant (Tavily seul).
+ */
+async function fetchGroqModelsList(ctx) {
+  const apiKey = String(process.env.GROQ_API_KEY || '').trim();
+  if (!apiKey) {
+    ctx.log.debug('official_endpoint.no_key', { id: 'groq-models', hint: 'GROQ_API_KEY absente côté serveur : repli sur Tavily seul' });
+    return null;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 6000);
+  try {
+    const res = await ctx.doFetch('https://api.groq.com/openai/v1/models', {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
+    if (!res.ok) { ctx.log.warn('official_endpoint.http_error', { id: 'groq-models', status: res.status }); return null; }
+    const json = await res.json();
+    const models = Array.isArray(json.data) ? json.data : [];
+    if (!models.length) return null;
+    const lines = models.map((m) => {
+      const bits = [m.id];
+      if (m.owned_by) bits.push(`par ${m.owned_by}`);
+      if (m.context_window) bits.push(`contexte ${m.context_window} tokens`);
+      if (m.active === false) bits.push('[INACTIF]');
+      return `- ${bits.join(' — ')}`;
+    }).join('\n');
+    return {
+      title: 'Modèles Groq — liste officielle en direct (API)',
+      url: 'https://console.groq.com/docs/models',
+      domain: 'api.groq.com',
+      content: `Liste obtenue en temps réel via GET https://api.groq.com/openai/v1/models (source faisant autorité, pas une page web indexée) :\n${lines}\n\nUn modèle absent de cette liste n'est plus proposé par l'API Groq, même s'il apparaît encore dans d'anciens articles ou comparatifs.`,
+      publishedAt: ctx.now.toISOString(),
+    };
+  } catch (e) {
+    ctx.log.warn('official_endpoint.failed', { id: 'groq-models', error: String((e && e.message) || e) });
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+registerOfficialEndpoint({
+  id: 'groq-models',
+  test: (text) => /\bgroq\b/i.test(text) && /\b(mod[eè]les?|models?|liste|d[eé]pr[eé]ci[eé]?s?|deprecat|retir[eé]s?|tool[-\s]?use|function[-\s]?calling)\b/i.test(text),
+  fetcher: fetchGroqModelsList,
+});
 
 // ───────────────────────────── 9. Exécution ─────────────────────────────────
 
@@ -811,16 +900,40 @@ async function searchWeb(message, options = {}) {
 
     const plan = await buildSearchPlan(message, { cfg, log, now, contextHint: options.contextHint, queryRewriter: options.queryRewriter });
     const ctx = { cfg, log, doFetch, now };
-    const runs = await Promise.all(plan.map((item) => runPlanItem(item, ctx)));
+
+    // Endpoint officiel vérifié (ex. liste des modèles Groq en direct) : lancé
+    // en parallèle de Tavily, jamais bloquant, jamais fatal en cas d'échec.
+    const matchedEndpoint = OFFICIAL_ENDPOINTS.find((e) => { try { return e.test(message); } catch { return false; } });
+    const endpointPromise = matchedEndpoint ? matchedEndpoint.fetcher(ctx) : Promise.resolve(null);
+
+    const [runs, endpointData] = await Promise.all([
+      Promise.all(plan.map((item) => runPlanItem(item, ctx))),
+      endpointPromise,
+    ]);
+    if (matchedEndpoint) log.debug('official_endpoint.match', { id: matchedEndpoint.id, used: !!endpointData });
 
     const okRuns = runs.filter((r) => r.info.status === 'ok');
     const errors = runs.filter((r) => r.info.error).map((r) => r.info.error);
     const retrieved = okRuns.reduce((n, r) => n + r.results.length, 0);
     const { kept, rejected } = processResults(okRuns.map((r) => ({ item: r.item, results: r.results })), plan, cfg);
 
-    const sources = kept.map((r) => ({
+    // La source faisant autorité passe toujours en tête, sans jamais être
+    // évincée par le plafond de résultats (cfg.maxTotalResults + 1 dans ce cas précis).
+    let finalKept = kept;
+    if (endpointData) {
+      const synthetic = {
+        id: null, title: endpointData.title, url: endpointData.url, domain: endpointData.domain,
+        content: endpointData.content, rawContent: null, score: 1, publishedAt: endpointData.publishedAt,
+        ageDays: 0, freshness: 'recent', favicon: null, sourceType: 'official',
+        preferred: true, authoritative: true, queryIds: plan.map((p) => p.id), suspicious: false,
+      };
+      finalKept = [synthetic, ...kept].slice(0, cfg.maxTotalResults + 1);
+    }
+    finalKept.forEach((r, i) => { r.id = 'S' + (i + 1); });
+
+    const sources = finalKept.map((r) => ({
       id: r.id, title: r.title, url: r.url, domain: r.domain, favicon: r.favicon,
-      publishedAt: r.publishedAt, freshness: r.freshness, sourceType: r.sourceType,
+      publishedAt: r.publishedAt, freshness: r.freshness, sourceType: r.sourceType, authoritative: !!r.authoritative,
     }));
     const answers = cfg.includeAnswer
       ? okRuns.filter((r) => r.answer).map((r) => ({ query: r.item.query, answer: r.answer }))
@@ -828,22 +941,28 @@ async function searchWeb(message, options = {}) {
 
     const totalMs = Date.now() - started;
     log.debug('search.done', {
-      queries: runs.length, ok: okRuns.length, retrieved, kept: kept.length, rejected: rejected.length,
-      domains: kept.map((r) => `${r.domain}(${r.sourceType})`), rejectedDetail: rejected.map((r) => `${r.domain}:${r.reason}`),
+      queries: runs.length, ok: okRuns.length, retrieved, kept: finalKept.length, rejected: rejected.length,
+      domains: finalKept.map((r) => `${r.domain}(${r.sourceType}${r.authoritative ? ',authoritative' : r.preferred ? ',preferred' : ''})`),
+      primaryDomain: finalKept[0] ? finalKept[0].domain : null,
+      officialEndpointUsed: !!endpointData,
+      rejectedDetail: rejected.map((r) => `${r.domain}:${r.reason}`),
       errors: errors.map((e) => e.code), totalMs,
     });
 
     return {
       triggered: true,
-      ok: okRuns.length > 0,
+      ok: okRuns.length > 0 || !!endpointData,
       intent,
       queries: runs.map((r) => r.info),
-      results: kept,
+      results: finalKept,
       sources,
       answers,
       rejected,
-      error: okRuns.length ? null : (errors[0] || { code: 'no_result', message: 'Aucune requête aboutie' }),
-      meta: { retrieved, kept: kept.length, totalMs, searchedAt: now.toISOString(), partialFailure: errors.length > 0 && okRuns.length > 0 },
+      error: (okRuns.length || endpointData) ? null : (errors[0] || { code: 'no_result', message: 'Aucune requête aboutie' }),
+      meta: {
+        retrieved, kept: finalKept.length, totalMs, searchedAt: now.toISOString(),
+        partialFailure: errors.length > 0 && okRuns.length > 0, officialEndpointUsed: !!endpointData,
+      },
     };
   } catch (e) {
     // Filet de sécurité : rien ne doit faire tomber le moteur de chat.
@@ -889,3 +1008,4 @@ module.exports = {
   isVagueQuery,
   _internal: { redact, normalizeUrl, degradePayload, buildPayload, processResults, INTENT_RULES, OFFICIAL_SOURCES },
 };
+
