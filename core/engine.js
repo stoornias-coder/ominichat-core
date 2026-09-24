@@ -21,6 +21,62 @@ const logger = require('./utils/logger');
 
 const SHORT_TERM_LIMIT = parseInt(process.env.SHORT_TERM_HISTORY_LIMIT || '16', 10);
 
+// Message utilisateur PRÉCÉDENT (le courant vient d'être sauvegardé, donc il est
+// le dernier de la liste) : sert de contexte aux questions de suivi trop vagues
+// ("et lui ?"). Voir core/search/webSearch.js -> options.contextHint.
+function previousUserMessage(recentMessages) {
+  const userMessages = (recentMessages || []).filter((m) => m.role === 'user');
+  return userMessages.length >= 2 ? userMessages[userMessages.length - 2].content : null;
+}
+
+/**
+ * Recherche web pour CE message. Ne lève jamais : une recherche ratée ne doit
+ * jamais empêcher le personnage de répondre.
+ *
+ * WEB_SEARCH_ENGINE=legacy réactive l'ancien moteur (core/search/webSearch.legacy.js,
+ * copie inchangée de l'ancien webSearch.js) : retour arrière sans toucher au code.
+ * WEB_SEARCH_MODE=off désactive complètement la recherche (moteur v2).
+ *
+ * @returns {Promise<{ promptInput: (object|string|null), sources: object[], meta: object }>}
+ *   promptInput : passé tel quel à buildSystemPrompt({ webSearchResult }).
+ *   sources     : métadonnées allégées, prêtes à être affichées par une interface.
+ */
+async function runWebSearch(text, recentMessages) {
+  const useLegacy = String(process.env.WEB_SEARCH_ENGINE || '').trim().toLowerCase() === 'legacy';
+  const idle = { promptInput: null, sources: [], meta: { engine: useLegacy ? 'legacy' : 'v2', triggered: false, ok: false } };
+
+  try {
+    if (useLegacy) {
+      const legacy = require('./search/webSearch.legacy');
+      if (!legacy.needsWebSearch(text)) return idle;
+      const block = await legacy.performWebSearch(text);
+      return { promptInput: block, sources: [], meta: { engine: 'legacy', triggered: true, ok: block !== null } };
+    }
+
+    const result = await webSearch.searchWeb(text, { contextHint: previousUserMessage(recentMessages) });
+    // Clé absente = problème de configuration, pas une recherche "tentée" :
+    // on garde le comportement historique (aucun bloc dans le prompt).
+    const injectable = result.triggered && !(result.error && result.error.code === 'no_api_key');
+    return {
+      promptInput: injectable ? result : null,
+      sources: result.sources || [],
+      meta: {
+        engine: 'v2',
+        triggered: result.triggered,
+        ok: result.ok,
+        intent: result.intent ? result.intent.intent : null,
+        retrieved: result.meta ? result.meta.retrieved : 0,
+        kept: result.meta ? result.meta.kept : 0,
+        durationMs: result.meta ? result.meta.totalMs : 0,
+        errorCode: result.error ? result.error.code : null,
+      },
+    };
+  } catch (err) {
+    logger.warn('Recherche web ignorée (erreur inattendue)', err.message);
+    return idle;
+  }
+}
+
 /**
  * Traite UN message utilisateur dans UNE session : c'est le seul chemin de
  * code qui appelle le modèle IA (1 message utilisateur = 1 appel IA).
@@ -31,7 +87,10 @@ const SHORT_TERM_LIMIT = parseInt(process.env.SHORT_TERM_HISTORY_LIMIT || '16', 
  *   Permet à une interface de déclencher un effet (ex : indicateur de
  *   saisie Telegram) sans que ce module ait la moindre connaissance d'une
  *   interface particulière.
- * @returns {Promise<{ reply: string, character: object, session: object }>}
+ * @returns {Promise<{ reply: string, character: object, session: object,
+ *   sources: object[], webSearch: object }>}
+ *   sources   : sources web utilisées pour cette réponse (vide si aucune recherche).
+ *   webSearch : résumé technique de la recherche (moteur, déclenchée ?, durée, code d'erreur).
  */
 async function processMessage({ user, session, text, onBeforeGenerate }) {
   const character = await characterManager.resolveCharacterForSession(session);
@@ -43,14 +102,11 @@ async function processMessage({ user, session, text, onBeforeGenerate }) {
     memoryManager.getRelevantMemories(user, session, character, text),
   ]);
 
-  // Recherche web : décision heuristique gratuite, exécution seulement si
-  // nécessaire (branchée sur Tavily, voir core/search/webSearch.js).
-  let webSearchResult = null;
-  if (webSearch.needsWebSearch(text)) {
-    webSearchResult = await webSearch.performWebSearch(text);
-  }
+  // Recherche web : décision par règles (gratuite, sans appel API), exécution
+  // seulement si nécessaire (Tavily, voir core/search/webSearch.js).
+  const search = await runWebSearch(text, recentMessages);
 
-  const systemPrompt = buildSystemPrompt({ character, memories, session, webSearchResult });
+  const systemPrompt = buildSystemPrompt({ character, memories, session, webSearchResult: search.promptInput });
 
   const messagesForModel = [
     { role: 'system', content: systemPrompt },
@@ -81,7 +137,9 @@ async function processMessage({ user, session, text, onBeforeGenerate }) {
     }
   }
 
-  return { reply, character, session };
+  // `sources` et `webSearch` sont additifs : les appelants existants (Telegram,
+  // Web) ne lisent que reply/character et ne sont donc pas affectés.
+  return { reply, character, session, sources: search.sources, webSearch: search.meta };
 }
 
 module.exports = { processMessage };
