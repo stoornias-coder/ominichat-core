@@ -845,6 +845,34 @@ function mergeNames(...lists) {
   return out;
 }
 
+/**
+ * Un `queryRewriter` externe (ex. celui branché par la route /api/search) n'est pas conçu
+ * spécifiquement pour l'identification floue : rien ne garantit qu'il produise, à chaque
+ * tentative, une reformulation qui apporte réellement des mots-clés nouveaux. S'il renvoie
+ * un texte quasi identique à une requête déjà essayée (même reformulation, troncature
+ * différente, etc.), une simple égalité de chaîne ne le détecte pas et une des 3 requêtes
+ * Tavily budgétées est alors gaspillée pour rien. On complète donc l'égalité stricte par un
+ * recoupement de mots-clés significatifs (réutilise `keywords()`, déjà utilisé par
+ * `sharesTopic` plus bas) : si la nouvelle requête n'apporte quasiment aucun mot-clé que la
+ * requête déjà essayée ne contenait pas, on la considère redondante et on préfère retomber
+ * sur les reformulations déterministes (`buildFuzzyVariant` / `buildFuzzyVerification`),
+ * elles conçues spécifiquement pour cibler les indices manquants. Seuil volontairement élevé
+ * (0.8) pour ne jamais bloquer une vraie reformulation qui, par construction (candidat +
+ * indices), partage légitimement quelques mots avec une requête précédente.
+ */
+function isRedundantQuery(candidateQuery, triedQueries) {
+  const kc = new Set(keywords(candidateQuery));
+  if (!kc.size) return false;
+  for (const t of triedQueries) {
+    const kt = new Set(keywords(t));
+    if (!kt.size) continue;
+    let shared = 0;
+    for (const k of kc) if (kt.has(k)) shared++;
+    if (shared / Math.min(kc.size, kt.size) >= 0.8) return true;
+  }
+  return false;
+}
+
 /** Toutes les entrées d'une table dont le "src" matche le texte, en excluant les labels niés. */
 function extractAxisMatches(text, table, negatedSet) {
   const out = [];
@@ -1093,7 +1121,9 @@ async function extendFuzzyIdentification({ message, fuzzyCtx, plan, runs, cfg, l
         const reason = purpose === 'fuzzy_verify' ? 'fuzzy_verification' : 'fuzzy_identification';
         const r = await queryRewriter(fuzzyCtx.text, { message, attempt: attemptNo, tried: tried.slice(), reason });
         const rq = typeof r === 'string' ? cleanText(r) : '';
-        if (rq && rq.length <= MAX_QUERY_CHARS && !tried.some((t) => norm(t) === norm(rq))) candidateQuery = rq;
+        const alreadyTried = rq && (tried.some((t) => norm(t) === norm(rq)) || isRedundantQuery(rq, tried));
+        if (rq && rq.length <= MAX_QUERY_CHARS && !alreadyTried) candidateQuery = rq;
+        else if (rq && alreadyTried) log.debug('fuzzy.rewriter_redundant', { attempt: attemptNo, query: rq });
       } catch (e) { log.warn('fuzzy.rewriter_failed', { error: String(e && e.message) }); }
     }
     if (!candidateQuery) candidateQuery = buildFuzzyVariant(fuzzyCtx, tried, attemptNo);
@@ -1511,7 +1541,7 @@ module.exports = {
   _internal: {
     redact, normalizeUrl, degradePayload, buildPayload, processResults, INTENT_RULES, OFFICIAL_SOURCES,
     detectFuzzyIdentification, assessFuzzyResults, buildFuzzyVariant, buildFuzzyVerification, annotateCorroboration,
-    extendFuzzyIdentification, FUZZY_MAX_TAVILY_CALLS, FUZZY_MAX_HISTORY,
+    extendFuzzyIdentification, FUZZY_MAX_TAVILY_CALLS, FUZZY_MAX_HISTORY, isRedundantQuery,
     extractNegatedClues, extractAxisMatches, extractSpokenLanguage, pickActiveGeo, extraAxesFor,
     FUZZY_GEO_TABLE, FUZZY_FORMAT_TABLE, FUZZY_ROLE_TABLE, FUZZY_LANGUAGE_TABLE,
   },
