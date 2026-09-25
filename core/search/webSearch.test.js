@@ -588,6 +588,111 @@ test('L. titre ambigu : un résultat au même titre mais correspondant à une au
   assert.equal(verdictBoth.candidate, good, 'seul le résultat qui recoupe réellement les indices devient le candidat');
 });
 
+// ═══════════════ N/O/P : reformulation quasi identique d'un queryRewriter externe ═══════════════
+// Reproduit le bug réel observé en production : le `queryRewriter` branché par la route
+// /api/search (ex. `async () => rewritten`) n'est pas conçu pour l'identification floue et peut
+// renvoyer, à une tentative suivante, un texte quasi identique à une requête déjà essayée. Sans
+// protection, cela gaspille une des 3 requêtes Tavily budgétées sur une recherche qui n'apporte
+// rien de nouveau — empêchant la 3e requête (vérification ciblée) d'avoir lieu.
+
+test('N. Cas A (message réel) : identification floue aboutit avec un vrai queryRewriter fonctionnel', async () => {
+  const queries = [];
+  const fetchImpl = async (u, init) => {
+    const q = JSON.parse(init.body).query;
+    queries.push(q);
+    if (queries.length === 1) {
+      return mkRes(200, okBody([
+        { title: 'Films populaires 2023', url: 'https://allocine.fr/films/populaires', content: 'Liste de films sortis récemment, tous pays confondus, sans lien avec la demande.', score: 0.5 },
+      ]));
+    }
+    return mkRes(200, okBody([
+      { title: 'Seducing Mr. Perfect - Wikipedia', url: 'https://en.wikipedia.org/wiki/Seducing_Mr._Perfect', content: 'South Korean film/drama. Robin is the male lead character, the boss of the female lead.', score: 0.6 },
+    ]));
+  };
+  // queryRewriter réaliste : reformule utilement à chaque appel (pas de doublon).
+  const queryRewriter = async (text, { attempt }) => `korean Robin drama movie title cast attempt${attempt}`;
+  const { o } = opts(fetchImpl, { skipIntentCheck: true, queryRewriter });
+  const r = await ws.searchWeb("Il y a un film k drama où le personnage masculin principal s'appelle Robin mais je me souviens plus du titre du film tu saurais ce que c'est ?", o);
+
+  assert.ok(queries.length >= 2 && queries.length <= 3, 'jamais plus de 3 requêtes Tavily au total');
+  assert.equal(r.meta.fuzzy.triggered, true);
+  assert.equal(r.meta.fuzzy.confirmed, true);
+  assert.match(r.meta.fuzzy.candidateTitle || '', /seducing mr\. perfect/i);
+});
+
+test('O. Cas B (queryRewriter type "renvoie toujours le même texte") : le budget de 3 requêtes est récupéré au lieu d\'être gaspillé', async () => {
+  const queries = [];
+  const fetchImpl = async (u, init) => {
+    const q = JSON.parse(init.body).query;
+    queries.push(q);
+    if (queries.length === 1) {
+      // 1er passage : aucun résultat pertinent.
+      return mkRes(200, okBody([
+        { title: 'Films populaires 2023', url: 'https://allocine.fr/films/populaires', content: 'Liste de films sortis récemment, tous pays confondus, sans lien avec la demande.', score: 0.5 },
+      ]));
+    }
+    if (queries.length === 2) {
+      // 2e passage (reformulation déterministe, puisque le rewriter redondant est écarté) :
+      // un candidat apparaît (Robin + coréen + boss), mais "anglais" reste à confirmer.
+      return mkRes(200, okBody([
+        { title: 'Boss in Seoul - Cast', url: 'https://mydramalist.com/boss-in-seoul', content: 'Korean movie. Robin is the male lead, the boss of the female lead character.', score: 0.6 },
+      ]));
+    }
+    // 3e passage (vérification déterministe) : confirme enfin l'indice manquant.
+    return mkRes(200, okBody([
+      { title: 'Boss in Seoul - Trivia', url: 'https://asianwiki.com/boss-in-seoul', content: 'In this Korean movie, Robin the boss character often spoke English with the female lead.', score: 0.55 },
+    ]));
+  };
+  // queryRewriter type "async () => rewritten" observé en production (searchHandler.js) : renvoie
+  // TOUJOURS le texte du message initial, quels que soient l'attempt/la reason passés.
+  const queryRewriter = async () => ROBIN_FULL;
+  const { o } = opts(fetchImpl, { skipIntentCheck: true, queryRewriter });
+  const r = await ws.searchWeb(ROBIN_FULL, o);
+
+  assert.ok(queries.length <= 3, 'jamais plus de 3 requêtes Tavily au total');
+  // Sans le correctif, la 2e requête serait un doublon du message initial (le rewriter redondant
+  // resservi tel quel) et il ne resterait plus de budget pour la vraie reformulation + vérification.
+  assert.equal(queries.length, 3, 'les 3 requêtes du budget sont utilisées malgré un rewriter qui ne renvoie que le texte initial');
+  assert.notEqual(queries[1].toLowerCase(), ROBIN_FULL.toLowerCase(), 'le texte redondant du rewriter n\'est jamais envoyé tel quel à Tavily comme 2e requête');
+  assert.equal(r.meta.fuzzy.triggered, true);
+  assert.equal(r.meta.fuzzy.confirmed, true, 'la confirmation progressive aboutit une fois le budget réellement disponible');
+  assert.match(r.meta.fuzzy.candidateTitle || '', /boss in seoul/i);
+});
+
+test('P. isRedundantQuery : détecte un texte quasi identique, laisse passer une vraie reformulation', () => {
+  const tried = ["Il y a un film coréen où le personnage masculin principal s'appelle Robin, il est le patron du personnage féminin et il parle souvent anglais."];
+  // Quasi identique (même texte) => redondant.
+  assert.equal(ws._internal.isRedundantQuery("Il y a un film coréen où le personnage masculin principal s'appelle Robin, il est le patron du personnage féminin et il parle souvent anglais.", tried), true);
+  // Vraie reformulation ciblée (peu de mots-clés en commun) => pas redondant.
+  assert.equal(ws._internal.isRedundantQuery('Seducing Mr. Perfect Robin English', tried), false);
+  assert.equal(ws._internal.isRedundantQuery('korean Robin boss English film cast character name identification', tried), false);
+});
+
+test('Q. non-régression : un queryRewriter absent continue de fonctionner comme avant (buildFuzzyVariant/Verification)', async () => {
+  const queries = [];
+  const fetchImpl = async (u, init) => {
+    const q = JSON.parse(init.body).query;
+    queries.push(q);
+    if (queries.length === 1) {
+      return mkRes(200, okBody([
+        { title: 'Films populaires 2023', url: 'https://allocine.fr/films/populaires', content: 'Liste de films sortis récemment, tous pays confondus, sans lien avec la demande.', score: 0.5 },
+      ]));
+    }
+    if (queries.length === 2) {
+      return mkRes(200, okBody([
+        { title: 'Seducing Mr. Perfect - Cast', url: 'https://mydramalist.com/seducing-mr-perfect', content: 'Korean movie. Robin is the male lead, the boss of the female lead character.', score: 0.6 },
+      ]));
+    }
+    return mkRes(200, okBody([
+      { title: 'Seducing Mr. Perfect - Trivia', url: 'https://asianwiki.com/seducing-mr-perfect', content: 'In this Korean movie, Robin the boss character often spoke English at the office with the female lead.', score: 0.55 },
+    ]));
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  const r = await ws.searchWeb(ROBIN_FULL, o);
+  assert.equal(queries.length, 3);
+  assert.equal(r.meta.fuzzy.confirmed, true);
+});
+
 test('M. question précise avec indices extras dans la question elle-même : aucune boucle floue inutile', async () => {
   let n = 0;
   const fetchImpl = async () => {
