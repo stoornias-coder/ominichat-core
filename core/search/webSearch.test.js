@@ -832,3 +832,174 @@ test("Y. aucun titre/personnage/œuvre n'est câblé en dur : la détection fonc
   assert.ok(ctx.names.includes('Zorbaxel'), "un nom propre jamais vu fonctionne, preuve qu'aucune liste de titres/personnages n'est en dur");
   assert.equal(ctx.geoLabel, 'korean');
 });
+
+// ═══════════════ PARTIE 3 : durcissement du fuzzy search (frontières de mot, proximité, ═══════════════
+// ═══════════════ sélection de candidat par qualité/cluster, axe temporel)               ═══════════════
+
+test('Fuzzy A. "Robin" ne matche jamais une simple occurrence de "Robinson" (frontières de mot réelles)', () => {
+  const fuzzyCtx = ws._internal.detectFuzzyIdentification(ROBIN_FULL, null);
+  const onlyRobinson = { title: 'Race-Based Casting Essay', url: 'https://example.org/essay', content: 'This long essay by J. Robinson discusses race-based casting practices in Hollywood studios at length.' };
+  const realRobin = { title: 'Some Korean Movie - Cast', url: 'https://mydramalist.com/some-korean-movie', content: 'Korean movie. Robin is the boss character who spoke English at work.' };
+  assert.equal(ws._internal.resultMatchesClues(onlyRobinson, fuzzyCtx), false, '"Robinson" seul ne doit jamais satisfaire l\'indice obligatoire "Robin"');
+  assert.equal(ws._internal.resultMatchesClues(realRobin, fuzzyCtx), true, '"Robin" en tant que mot isolé doit bien matcher');
+  assert.equal(ws._internal.nameBoundaryRx('Robin').test('robinson plays the role'), false);
+  assert.equal(ws._internal.nameBoundaryRx('Robin').test('robin heiden plays the role'), true);
+});
+
+test("Fuzzy B. indices dispersés sans rapport sémantique proche => confirmation plus faible qu'un résultat cohérent", () => {
+  const fuzzyCtx = ws._internal.detectFuzzyIdentification(ROBIN_FULL, null);
+  const filler = 'Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore. '.repeat(4);
+  const dispersed = {
+    title: 'General Entertainment Roundup', url: 'https://blogexample.net/roundup', domain: 'blogexample.net', sourceType: 'other',
+    content: `Robin is mentioned briefly here. ${filler} Meanwhile, elsewhere in Korean media, an English-speaking boss discussed a movie unrelated to this piece.`,
+  };
+  const cohesive = {
+    title: 'Some Korean Movie - Cast', url: 'https://blogexample2.net/cast', domain: 'blogexample2.net', sourceType: 'other',
+    content: 'Korean movie. Robin is the boss character who spoke English at work with the female lead.',
+  };
+  assert.equal(ws._internal.resultMatchesClues(dispersed, fuzzyCtx), true, 'les indices obligatoires sont bien présents, même dispersés');
+  const verdictCohesiveOnly = ws._internal.assessFuzzyResults([cohesive], fuzzyCtx);
+  assert.equal(verdictCohesiveOnly.ok, true, 'un résultat cohérent confirme pleinement l\'identification à lui seul');
+  const verdictBoth = ws._internal.assessFuzzyResults([dispersed, cohesive], fuzzyCtx);
+  assert.equal(verdictBoth.candidate, cohesive, 'le résultat cohérent l\'emporte sur le résultat dispersé, même si celui-ci contient aussi tous les mots-clés');
+});
+
+test('Fuzzy C. un mauvais résultat riche en mots-clés accidentels ne devient jamais le candidat gagnant (cas réel reproduit)', async () => {
+  const queries = [];
+  const fetchImpl = async (u, init) => {
+    const q = JSON.parse(init.body).query;
+    queries.push(q);
+    if (queries.length === 1) {
+      return mkRes(200, okBody([
+        {
+          title: '"And the Oscar Goes to; Well, It Can\'t Be You, Can It": Race-Based Casting and Title VII',
+          url: 'https://example.org/oscar-race-based-casting',
+          content: 'This law review article about Title VII discusses race-based casting in Hollywood, cites a producer named Robinson as a case study, references Korean-American actors broadly, and quotes a studio boss about English-language remakes decades later.',
+          score: 0.5,
+        },
+      ]));
+    }
+    return mkRes(200, okBody([
+      { title: 'Some Korean Movie - Cast', url: 'https://mydramalist.com/some-korean-movie', content: 'Korean movie. Robin is the boss character who spoke English at work with the female lead.', score: 0.6 },
+    ]));
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  const r = await ws.searchWeb(ROBIN_FULL, o);
+  assert.ok(queries.length <= 3);
+  assert.doesNotMatch(r.meta.fuzzy.candidateTitle || '', /oscar/i, 'le faux résultat ne doit jamais devenir le candidat malgré ses correspondances lexicales accidentelles');
+});
+
+test('Fuzzy D. un résultat cohérent sur tous les axes (géo, format, nom, rôle, genre, époque) devient candidat', () => {
+  const ctx = ws._internal.detectFuzzyIdentification(
+    "Il y a un film romantique coréen des années 2000 où Robin est le patron du personnage féminin.",
+    null,
+  );
+  assert.ok(ctx);
+  assert.ok(ctx.time && ctx.time.min === 2000 && ctx.time.max === 2009, 'l\'axe temporel "années 2000" est bien capté');
+  const good = {
+    title: 'Seducing Mr. Perfect (2006) - Cast', url: 'https://mydramalist.com/seducing-mr-perfect', domain: 'mydramalist.com', sourceType: 'reference',
+    content: 'This 2006 Korean romance movie features Robin as the boss of the female lead character.',
+  };
+  const verdict = ws._internal.assessFuzzyResults([good], ctx);
+  assert.equal(verdict.candidate, good);
+  assert.equal(verdict.ok, true);
+});
+
+test('Fuzzy E. deux sources indépendantes cohérentes sur la même œuvre battent une source isolée ambiguë', () => {
+  const fuzzyCtx = ws._internal.detectFuzzyIdentification(ROBIN_FULL, null);
+  const isolatedAmbiguous = {
+    title: 'Random Forum Post', url: 'https://forum.example.com/thread/1', domain: 'forum.example.com', sourceType: 'other',
+    content: 'Korean movie. Robin might be the boss? Not totally sure, someone mentioned English too, hard to tell if this is even the right one honestly.',
+  };
+  const corroborated1 = {
+    title: 'Seducing Mr. Perfect (2006) - IMDb', url: 'https://imdb.com/title/x', domain: 'imdb.com', sourceType: 'reference',
+    content: 'Korean movie. Robin is the boss of the female lead and speaks English at the office.',
+  };
+  const corroborated2 = {
+    title: 'Seducing Mr. Perfect - Wikipedia', url: 'https://en.wikipedia.org/wiki/Seducing_Mr._Perfect', domain: 'en.wikipedia.org', sourceType: 'reference',
+    content: 'A South Korean movie. Robin, the boss character, often speaks English with the female lead.',
+  };
+  const verdict = ws._internal.assessFuzzyResults([isolatedAmbiguous, corroborated1, corroborated2], fuzzyCtx);
+  assert.notEqual(verdict.candidate, isolatedAmbiguous, 'la source isolée et ambiguë ne doit pas l\'emporter face à deux sources qui se recoupent');
+  assert.match(verdict.candidate.title, /seducing mr\. perfect/i);
+});
+
+test('Fuzzy F. une source communautaire isolée ne suffit jamais seule à produire "confirmed"', () => {
+  const fuzzyCtx = ws._internal.detectFuzzyIdentification(ROBIN_FULL, null);
+  const reddit = {
+    title: 'r/kdrama - identification help', url: 'https://reddit.com/r/kdrama/comments/x', domain: 'reddit.com', sourceType: 'community',
+    content: 'Korean movie. Robin is the boss character and speaks English at work with the female lead.',
+  };
+  const verdict = ws._internal.assessFuzzyResults([reddit], fuzzyCtx);
+  assert.equal(verdict.ok, false, 'une source communautaire isolée, même textuellement complète, ne doit pas suffire seule');
+  assert.ok(verdict.candidate, 'elle reste néanmoins un candidat plausible, juste pas confirmé');
+});
+
+test('Fuzzy G. le parser d\'époque récupère correctement "années 2000" → 2000-2009 (et une année précise)', () => {
+  assert.deepEqual(ws._internal.detectTimePeriod('un film des années 2000'), { label: '2000s', min: 2000, max: 2009 });
+  assert.deepEqual(ws._internal.detectTimePeriod('sorti dans les années 2010'), { label: '2010s', min: 2010, max: 2019 });
+  assert.deepEqual(ws._internal.detectTimePeriod('un drama des années 1990'), { label: '1990s', min: 1990, max: 1999 });
+  assert.deepEqual(ws._internal.detectTimePeriod('sorti en 2006'), { label: '2006', min: 2006, max: 2006 });
+  assert.equal(ws._internal.detectTimePeriod('aucune date ici'), null);
+});
+
+test("Fuzzy H. follow-up de genre : \"C'est une romance coréenne.\" enrichit bien le contexte précédent (non-régression du comportement existant)", () => {
+  const ctx = ws._internal.detectFuzzyIdentification("C'est une romance coréenne.", null, [ROBIN_FULL]);
+  assert.ok(ctx);
+  assert.ok(ctx.genre.some((g) => g.label === 'romance'));
+  assert.ok(ctx.names.some((n) => n.toLowerCase() === 'robin'));
+});
+
+test('Fuzzy I. follow-up temporel : "Et je crois que ça date des années 2000." enrichit le contexte précédent', () => {
+  const ctx = ws._internal.detectFuzzyIdentification('Et je crois que ça date des années 2000.', null, [ROBIN_FULL]);
+  assert.ok(ctx, 'le suivi purement temporel est bien rattaché à la séquence précédente');
+  assert.ok(ctx.time, 'la période est bien détectée');
+  assert.equal(ctx.time.min, 2000);
+  assert.equal(ctx.time.max, 2009);
+  assert.ok(ctx.names.some((n) => n.toLowerCase() === 'robin'), 'les indices précédents (nom) restent fusionnés');
+  assert.ok(ctx.role.some((r) => r.label === 'boss'), 'les indices précédents (rôle) restent fusionnés');
+});
+
+test("Fuzzy J. un message court sans rapport n'hérite pas abusivement d'un ancien contexte flou", () => {
+  const ctx = ws._internal.detectFuzzyIdentification('Merci beaucoup !', null, [ROBIN_FULL]);
+  assert.equal(ctx, null, "un simple remerciement ne doit jamais réactiver une ancienne identification floue");
+});
+
+test('Fuzzy K. le plafond de 3 appels Tavily reste respecté avec la nouvelle logique de scoring/clustering', async () => {
+  let n = 0;
+  const fetchImpl = async () => {
+    n++;
+    return mkRes(200, okBody([
+      { title: `Divers sans rapport ${n}`, url: `https://example.org/x${n}`, content: 'Contenu générique sans rapport avec les indices demandés du tout, à chaque fois différent.', score: 0.3 },
+    ]));
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  await ws.searchWeb(ROBIN_FULL, o);
+  assert.ok(n <= 3, `au plus 3 requêtes Tavily, obtenu ${n}`);
+});
+
+test('Fuzzy L. non-régression : une recherche normale non-floue reste inchangée', async () => {
+  let n = 0;
+  const fetchImpl = async () => { n++; return mkRes(200, okBody([{ title: 'Doc Groq', url: 'https://console.groq.com/docs', content: 'groq doc', score: 0.5 }])); };
+  const { o } = opts(fetchImpl);
+  const r = await ws.searchWeb('Quels sont les modèles Groq disponibles ?', o);
+  assert.equal(n, 1);
+  assert.equal(r.meta.fuzzy.triggered, false);
+});
+
+test("Fuzzy M. aucun titre/personnage n'est câblé en dur : la sélection de candidat fonctionne avec un nom et un titre totalement inédits", () => {
+  const ctx = ws._internal.detectFuzzyIdentification(
+    "Il y a un film coréen où Zorbaxel est le patron du personnage principal, il parle souvent anglais, mais j'ai oublié le titre.",
+    null,
+  );
+  const decoy = {
+    title: 'Unrelated Essay About Zorbaxelson', url: 'https://example.org/essay', domain: 'example.org', sourceType: 'other',
+    content: 'This essay discusses a historian named Zorbaxelson and race-based hiring practices in Korea, with no real connection to any film or boss character.',
+  };
+  const good = {
+    title: 'Quixolt Dreams (2012) - Cast', url: 'https://mydramalist.com/quixolt-dreams', domain: 'mydramalist.com', sourceType: 'reference',
+    content: 'Korean movie. Zorbaxel is the boss character who speaks English at the office with the male lead.',
+  };
+  const verdict = ws._internal.assessFuzzyResults([decoy, good], ctx);
+  assert.equal(verdict.candidate, good, "le vrai candidat l'emporte grâce aux indices, jamais à un nom câblé en dur");
+});
