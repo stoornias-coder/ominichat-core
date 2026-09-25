@@ -729,6 +729,249 @@ function processResults(perQuery, plan, cfg) {
   return { kept: out, rejected };
 }
 
+// ───────────────── 8ter. Identification d'œuvre floue (recherche adaptative) ─────────────────
+//
+// Cas visé : « Il y a un film coréen dont le personnage s'appelle Robin, mais j'ai oublié le titre. »
+// À la différence d'une question précise (« Qui joue Robin dans <titre> ? »), une seule requête Tavily
+// ne suffit pas toujours à confirmer l'identification. On ne déclenche une extension (jusqu'à 2 requêtes
+// de plus, 3 au total) QUE si :
+//   1) le message ressemble à une identification d'œuvre vague (ou au suivi court d'une telle demande) ;
+//   2) le premier passage ne contient AUCUN résultat qui recoupe les indices forts du message.
+// Une question précise, un message sans indice, ou une recherche déjà scindée en sous-questions ne
+// déclenchent jamais l'extension : searchWeb() garde alors son comportement normal à une seule requête.
+//
+// Logique volontairement calquée sur celle déjà présente côté frontend (index.html : _getFuzzyContext /
+// _adaptiveFuzzyExtend), adaptée ici au backend. Aucune valeur en dur (aucun titre, personnage, acteur
+// particulier) : tout est dérivé du texte de l'utilisateur, comme le reste du fichier.
+
+const FUZZY_MAX_TAVILY_CALLS = 3;
+
+// Nationalité/langue → { label pour les requêtes de secours, rx pour reconnaître l'indice dans un résultat }.
+const FUZZY_GEO_TABLE = [
+  { src: /\b(cor[eé]en(?:ne)?s?|cor[eé]e|k.?drama|kdrama|korean|korea)\b/i, label: 'korean', rx: /korea|k-?drama|hangul|cor[eé]e/i },
+  { src: /\b(japonais(?:e)?|japan(?:ese)?|j.?drama|jdrama|dorama)\b/i, label: 'japanese', rx: /japan|j-?drama|dorama|japon/i },
+  { src: /\b(chinois(?:e)?|china|chinese|c.?drama|cdrama|mandarin)\b/i, label: 'chinese', rx: /chin(?:a|ese)|c-?drama|mandarin|chine|chinois/i },
+  { src: /\b(ta[iï]wan(?:ais(?:e)?)?|taiwanese)\b/i, label: 'taiwanese', rx: /taiwan/i },
+  { src: /\b(tha[iï](?:landais(?:e)?)?|thai|lakorn)\b/i, label: 'thai', rx: /thai|lakorn/i },
+  { src: /\b(indien(?:ne)?|india|bollywood|hindi|tamil)\b/i, label: 'indian', rx: /india|bollywood|hindi|tamil|indien/i },
+  { src: /\b(fran[çc]ais(?:e)?|french|france)\b/i, label: 'french', rx: /fran[cç]|french/i },
+];
+const FUZZY_WORK_TERM = /\b(film|movie|cin[eé]ma|s[eé]rie|series|drama|k.?drama|kdrama|anime|dorama|manga|webtoon|manhwa|roman|livre|novel|jeu|game)\b/i;
+const FUZZY_IDENT_CUE = /\b(il\s+y\s+a|ya|je\s+cherche|tu\s+(?:sais|connais))\b.*\b(film|s[eé]rie|drama|anime|dorama)\b|\b(?:vieux|ancien|old)\b.*\b(film|s[eé]rie|drama|anime)\b/i;
+const FUZZY_MEMORY_CUE = /(?:me\s+(?:souviens|rappelle)|retrouve)\s+(?:plus|pas)|(?:oubli[eé]|forgot|forgotten)\s+(?:le\s+|the\s+)?(?:titre|title|nom)|titre\s+m['’]?[eé]chappe|c['’]est\s+quoi\s+(?:ce|cette|le|la)\s+(?:film|s[eé]rie|drama|anime|dorama)|(?:quel|quelle)\s+(?:est\s+)?(?:ce\s+|cette\s+|le\s+|la\s+)?(?:film|s[eé]rie|drama|anime|dorama)|can['’]?t\s+remember/i;
+const FUZZY_NAME_STOP = new Set(('je il elle on tu nous vous ils elles c ce cet cette ces le la les un une des du de et ou mais donc si ya salut bonjour coucou hey hello merci film drama serie série anime coréen coreen coréenne japonais chinois netflix youtube google après alors donc bref voici voilà enfin quand comment pourquoi').split(/\s+/));
+// Élisions grammaticales (c'/j'/n'/m'/t'/s'/d' + mot) : jamais un nom propre, quelle que soit sa position.
+const FUZZY_ELISION_RX = /^[cjnmtsd]['’]/i;
+
+const fuzzyGeoMatch = (text) => FUZZY_GEO_TABLE.find((g) => g.src.test(text)) || null;
+
+/**
+ * Noms propres/citations dérivés du texte (jamais de liste en dur d'œuvres ou de personnages).
+ * Une majuscule en tout début du texte fourni est autorisée (un indice de suivi court commence
+ * souvent directement par le nom cherché, ex. "Robin était le patron...") ; seule une majuscule
+ * suivant la fin d'une AUTRE phrase à l'intérieur du même texte est écartée (capitalisation de
+ * phrase ordinaire), avec les mots-outils et élisions courants toujours filtrés par ailleurs.
+ */
+function extractProperNouns(text) {
+  const names = [];
+  let m;
+  const quoted = /["«“]([^"»”]{2,40})["»”]/g;
+  while ((m = quoted.exec(text)) && names.length < 4) names.push(m[1].trim());
+  const caps = /(^|[\s,;:(])([A-ZÀÂÆÇÉÈÊËÎÏÔÙÛÜŸ][\wÀ-ÿ'’-]{2,})/g;
+  while ((m = caps.exec(text)) && names.length < 4) {
+    const before = text.slice(0, m.index + m[1].length).trimEnd();
+    if (/[.!?]$/.test(before)) continue; // majuscule après la fin d'une autre phrase => pas un nom propre
+    const w = m[2].replace(/['’-]+$/, '');
+    if (FUZZY_ELISION_RX.test(w) || FUZZY_NAME_STOP.has(w.toLowerCase())) continue;
+    if (!names.some((n) => n.toLowerCase() === w.toLowerCase())) names.push(w);
+  }
+  return names;
+}
+
+/** Fusionne des listes de noms en dédoublonnant sans tenir compte de la casse (plafond 4). */
+function mergeNames(...lists) {
+  const out = [];
+  for (const list of lists) {
+    for (const n of list) {
+      if (out.length >= 4) return out;
+      if (!out.some((o) => o.toLowerCase() === n.toLowerCase())) out.push(n);
+    }
+  }
+  return out;
+}
+
+const isFuzzyText = (t) => (FUZZY_IDENT_CUE.test(t) || FUZZY_MEMORY_CUE.test(t)) && FUZZY_WORK_TERM.test(t);
+// Gate côté message COURANT : un indice de suivi peut être un simple nom propre, sans répéter
+// "film/drama" (ex. « Robin était le patron du personnage féminin. »).
+const hasIdentificationClue = (t) => FUZZY_WORK_TERM.test(t) || !!fuzzyGeoMatch(t) || extractProperNouns(t).length > 0;
+// Gate côté message PRÉCÉDENT (contextHint) : volontairement plus strict, pour qu'un message sans
+// rapport (contenant par hasard un prénom) ne déclenche jamais l'extension à tort.
+const looksLikeContinuedIdentification = (t) => isFuzzyText(t) || (FUZZY_WORK_TERM.test(t) && !!fuzzyGeoMatch(t));
+
+/**
+ * Détecte une identification d'œuvre floue et en extrait les indices forts (nationalité, noms propres).
+ * Gère aussi le suivi court d'une identification déjà entamée ("C'est un film coréen, pas un drama.").
+ * Retourne null si le message est une question précise ou sans rapport : searchWeb() garde alors son
+ * comportement normal à une seule requête (non-régression).
+ * @returns {null|{text:string, followUp:boolean, geoLabel:string, geoRx:RegExp|null, names:string[]}}
+ */
+function detectFuzzyIdentification(message, contextHint) {
+  const q = cleanText(String(message ?? ''));
+  if (!q) return null;
+  let text = q;
+  let followUp = false;
+  let prev = '';
+  if (!isFuzzyText(q)) {
+    prev = typeof contextHint === 'string' ? cleanText(contextHint) : '';
+    const words = q.split(/\s+/).filter(Boolean).length;
+    if (prev && words <= 30 && hasIdentificationClue(q) && looksLikeContinuedIdentification(prev)) {
+      text = `${prev}. ${q}`;
+      followUp = true;
+    } else {
+      return null;
+    }
+  }
+  const geo = fuzzyGeoMatch(text);
+  // Suivi : les noms sont extraits séparément de chaque message (q, puis prev) et fusionnés — jamais
+  // depuis le texte concaténé, sans quoi un indice qui ouvre le message de suivi (ex. "Robin était...")
+  // se retrouverait juste après un point ajouté par la concaténation et serait écarté à tort.
+  const names = followUp ? mergeNames(extractProperNouns(q), extractProperNouns(prev)) : extractProperNouns(text);
+  return { text, followUp, geoLabel: geo ? geo.label : '', geoRx: geo ? geo.rx : null, names };
+}
+
+/** Un résultat n'est "pertinent" que s'il recoupe les indices forts fournis (nationalité, nom propre). */
+function resultMatchesClues(r, fuzzyCtx) {
+  const txt = norm(`${r.title || ''} ${r.content || ''} ${r.rawContent || ''}`);
+  if (txt.trim().length < 40) return false; // trop pauvre/générique pour confirmer quoi que ce soit
+  if (fuzzyCtx.geoRx && !fuzzyCtx.geoRx.test(txt)) return false;
+  if (fuzzyCtx.names.length && !fuzzyCtx.names.some((n) => txt.includes(norm(n)))) return false;
+  return true;
+}
+
+function assessFuzzyResults(results, fuzzyCtx) {
+  if (!results.length) return { ok: false, onTopic: 0 };
+  const onTopic = results.filter((r) => resultMatchesClues(r, fuzzyCtx)).length;
+  return { ok: onTopic > 0, onTopic };
+}
+
+/** Reformulation déterministe (sans dépendance payante) : indices connus + angle de recherche différent. */
+function buildFuzzyVariant(fuzzyCtx, tried, attemptNo) {
+  const base = [fuzzyCtx.geoLabel, ...fuzzyCtx.names].filter(Boolean).join(' ').trim();
+  if (!base) return null;
+  const suffix = attemptNo <= 2 ? 'movie drama title character' : 'cast character name identification';
+  const candidate = cleanText(`${base} ${suffix}`);
+  const seen = (q) => tried.some((t) => norm(t) === norm(q));
+  if (!candidate || seen(candidate)) return null;
+  return candidate;
+}
+
+/**
+ * Étend une recherche d'identification floue : 2e puis (au plus) 3e requête, uniquement tant que les
+ * résultats ne recoupent aucun indice fort. Plafond ABSOLU : FUZZY_MAX_TAVILY_CALLS requêtes Tavily au
+ * total pour ce message (requête initiale incluse ; un éventuel retry HTTP compte aussi dans le budget).
+ * @returns {null|{items:object[], runs:object[], meta:{triggered:boolean, attempts:number, finalOk:boolean, onTopic:number}}}
+ */
+async function extendFuzzyIdentification({ message, fuzzyCtx, plan, runs, cfg, log, ctx, queryRewriter }) {
+  const initialItem = plan[0];
+  const initialResults = runs.filter((r) => r.info.status === 'ok').flatMap((r) => r.results);
+  let verdict = assessFuzzyResults(initialResults, fuzzyCtx);
+  if (verdict.ok) {
+    // Identification floue détectée, mais le 1er passage recoupe déjà les indices : aucune requête
+    // Tavily supplémentaire. `triggered` reflète la détection, pas le nombre de requêtes envoyées.
+    return { items: [], runs: [], meta: { triggered: true, attempts: 0, finalOk: true, onTopic: verdict.onTopic } };
+  }
+
+  const callsUsed = runs.reduce((n, r) => n + r.info.attempts, 0);
+  let budget = FUZZY_MAX_TAVILY_CALLS - callsUsed;
+  if (budget <= 0) {
+    log.debug('fuzzy.budget_exhausted', { callsUsed });
+    return { items: [], runs: [], meta: { triggered: true, attempts: 0, finalOk: verdict.ok, onTopic: verdict.onTopic } };
+  }
+
+  const tried = [initialItem.original];
+  const pool = initialResults.slice();
+  const items = [];
+  const newRuns = [];
+  let attemptNo = 2;
+
+  while (!verdict.ok && budget > 0 && attemptNo <= FUZZY_MAX_TAVILY_CALLS) {
+    let candidate = null;
+    if (typeof queryRewriter === 'function') {
+      try {
+        const r = await queryRewriter(fuzzyCtx.text, { message, attempt: attemptNo, tried: tried.slice(), reason: 'fuzzy_identification' });
+        const rq = typeof r === 'string' ? cleanText(r) : '';
+        if (rq && rq.length <= MAX_QUERY_CHARS && !tried.some((t) => norm(t) === norm(rq))) candidate = rq;
+      } catch (e) { log.warn('fuzzy.rewriter_failed', { error: String(e && e.message) }); }
+    }
+    if (!candidate) candidate = buildFuzzyVariant(fuzzyCtx, tried, attemptNo);
+    if (!candidate) { log.debug('fuzzy.no_more_variants', { attemptNo }); break; }
+    tried.push(candidate);
+
+    const item = {
+      id: `${initialItem.id}f${attemptNo}`, purpose: 'fuzzy_retry',
+      original: truncate(candidate, 160, false), query: truncate(cleanText(candidate), MAX_QUERY_CHARS, false),
+      topic: 'general', timeRange: null, freshness: false,
+      officialDomains: initialItem.officialDomains, entities: initialItem.entities, rewritten: true,
+    };
+    log.debug('fuzzy.extend', { attempt: attemptNo, query: item.query });
+    const run = await runPlanItem(item, ctx);
+    budget -= Math.max(1, run.info.attempts);
+    items.push(item);
+    newRuns.push(run);
+    if (run.info.status === 'ok') pool.push(...run.results);
+    verdict = assessFuzzyResults(pool, fuzzyCtx);
+    attemptNo++;
+  }
+
+  return { items, runs: newRuns, meta: { triggered: true, attempts: items.length, finalOk: verdict.ok, onTopic: verdict.onTopic } };
+}
+
+// — Anti-hallucination : fiabilité des résultats conservés, en 3 niveaux distincts —
+//  'strong'       : recoupé par une autre source indépendante dans le lot conservé, OU source UNIQUE
+//                   mais primaire/fiable (référence, officielle, institutionnelle), OU source officielle
+//                   interrogée en direct (authoritative). Une source primaire seule n'est PAS pénalisée.
+//  'weak'         : source UNIQUE et non primaire (communautaire, média isolé, site non classé...) —
+//                   trouvée, mais pas suffisamment étayée pour devenir un fait canonique.
+//  'unverifiable' : identification floue jamais confirmée malgré l'extension (voir extendFuzzyIdentification
+//                   ci-dessus) — aucun détail ne doit alors être présenté comme un fait acquis.
+// Une note est injectée dans r.content (jamais dans le titre/l'URL, jamais dans les champs consommés
+// pour le filtrage) pour que le prompt en aval (promptBuilder.js, non modifié) affiche l'avertissement
+// sans traitement spécial de sa part : le texte de l'extrait porte lui-même la réserve.
+const RELIABLE_SINGLE_SOURCE_TYPES = new Set(['official', 'institutional', 'reference']);
+const CORROBORATION_NOTE = {
+  weak: '[Source unique et non primaire : à traiter avec prudence, ne pas présenter comme un fait établi.] ',
+  unverifiable: "[Identification non confirmée après plusieurs recherches : ne présente aucun détail (titre, personnage, relation) comme acquis tant qu'il n'est pas recoupé.] ",
+};
+
+/** Deux résultats "se recoupent" s'ils partagent assez de mots-clés significatifs (sujet commun),
+ *  pas seulement parce qu'ils figurent tous les deux dans le même lot de résultats conservés. */
+function sharesTopic(a, b) {
+  const ka = keywords(`${a.title || ''} ${a.content || ''}`);
+  const kb = new Set(keywords(`${b.title || ''} ${b.content || ''}`));
+  if (ka.length < 3 || kb.size < 3) return false;
+  // Seuil à 3 mots-clés partagés (pas 2) : deux résultats d'une même recherche partagent quasi
+  // toujours 1-2 mots (le sujet/titre lui-même) sans que cela ne corrobore un fait précis pour autant.
+  return ka.filter((k) => kb.has(k)).length >= 3;
+}
+
+function annotateCorroboration(kept, { forceUnverifiable = false } = {}) {
+  for (const r of kept) {
+    let tier;
+    if (forceUnverifiable) {
+      tier = 'unverifiable';
+    } else if (r.authoritative || RELIABLE_SINGLE_SOURCE_TYPES.has(r.sourceType)) {
+      tier = 'strong'; // source officielle en direct, ou source primaire/fiable même seule : jamais pénalisée
+    } else {
+      const corroborated = kept.some((other) => other !== r && other.domain !== r.domain && sharesTopic(r, other));
+      tier = corroborated ? 'strong' : 'weak';
+    }
+    r.corroboration = tier;
+    const note = CORROBORATION_NOTE[tier];
+    if (note && r.content && !r.content.startsWith(note)) r.content = note + r.content;
+  }
+  return kept;
+}
+
 // ───────────────────────── 8bis. Endpoints officiels vérifiés ───────────────
 //
 // Pour certains faits à très haut risque d'hallucination (ex. "quels modèles
@@ -929,7 +1172,7 @@ async function searchWeb(message, options = {}) {
     }
     const now = options.now instanceof Date ? options.now : new Date();
 
-    const plan = await buildSearchPlan(message, { cfg, log, now, contextHint: options.contextHint, queryRewriter: options.queryRewriter });
+    let plan = await buildSearchPlan(message, { cfg, log, now, contextHint: options.contextHint, queryRewriter: options.queryRewriter });
     const ctx = { cfg, log, doFetch, now };
 
     // Endpoint officiel vérifié (ex. liste des modèles Groq en direct) : lancé
@@ -937,16 +1180,37 @@ async function searchWeb(message, options = {}) {
     const matchedEndpoint = OFFICIAL_ENDPOINTS.find((e) => { try { return e.test(message); } catch { return false; } });
     const endpointPromise = matchedEndpoint ? matchedEndpoint.fetcher(ctx) : Promise.resolve(null);
 
-    const [runs, endpointData] = await Promise.all([
-      Promise.all(plan.map((item) => runPlanItem(item, ctx))),
-      endpointPromise,
-    ]);
+    let runs = await Promise.all(plan.map((item) => runPlanItem(item, ctx)));
+
+    // Identification d'œuvre floue (section 8ter) : ne s'applique JAMAIS à une recherche déjà scindée
+    // en sous-questions, ni à une question précise (detectFuzzyIdentification renvoie alors null) —
+    // le comportement à une seule requête Tavily reste inchangé dans tous les autres cas.
+    let fuzzyInfo = null;
+    if (plan.length === 1) {
+      const fuzzyCtx = detectFuzzyIdentification(message, options.contextHint);
+      if (fuzzyCtx) {
+        const extension = await extendFuzzyIdentification({
+          message, fuzzyCtx, plan, runs, cfg, log, ctx, queryRewriter: options.queryRewriter,
+        });
+        if (extension) {
+          plan = plan.concat(extension.items);
+          runs = runs.concat(extension.runs);
+          fuzzyInfo = extension.meta;
+        }
+      }
+    }
+
+    const endpointData = await endpointPromise;
     if (matchedEndpoint) log.debug('official_endpoint.match', { id: matchedEndpoint.id, used: !!endpointData });
 
     const okRuns = runs.filter((r) => r.info.status === 'ok');
     const errors = runs.filter((r) => r.info.error).map((r) => r.info.error);
     const retrieved = okRuns.reduce((n, r) => n + r.results.length, 0);
     const { kept, rejected } = processResults(okRuns.map((r) => ({ item: r.item, results: r.results })), plan, cfg);
+    // Anti-hallucination : classe chaque résultat conservé (voir section 8ter) et injecte une réserve
+    // dans son extrait si la corroboration est insuffisante ou si l'identification floue n'a jamais abouti.
+    annotateCorroboration(kept, { forceUnverifiable: !!(fuzzyInfo && fuzzyInfo.triggered && !fuzzyInfo.finalOk) });
+    if (fuzzyInfo) log.debug('fuzzy.done', fuzzyInfo);
 
     // La source faisant autorité passe toujours en tête, sans jamais être
     // évincée par le plafond de résultats (cfg.maxTotalResults + 1 dans ce cas précis).
@@ -957,6 +1221,7 @@ async function searchWeb(message, options = {}) {
         content: endpointData.content, rawContent: null, score: 1, publishedAt: endpointData.publishedAt,
         ageDays: 0, freshness: 'recent', favicon: null, sourceType: 'official',
         preferred: true, authoritative: true, queryIds: plan.map((p) => p.id), suspicious: false,
+        corroboration: 'strong',
       };
       finalKept = [synthetic, ...kept].slice(0, cfg.maxTotalResults + 1);
     }
@@ -978,6 +1243,7 @@ async function searchWeb(message, options = {}) {
       officialEndpointUsed: !!endpointData,
       rejectedDetail: rejected.map((r) => `${r.domain}:${r.reason}`),
       errors: errors.map((e) => e.code), totalMs,
+      fuzzyAttempts: fuzzyInfo ? fuzzyInfo.attempts : 0,
     });
 
     return {
@@ -993,6 +1259,9 @@ async function searchWeb(message, options = {}) {
       meta: {
         retrieved, kept: finalKept.length, totalMs, searchedAt: now.toISOString(),
         partialFailure: errors.length > 0 && okRuns.length > 0, officialEndpointUsed: !!endpointData,
+        fuzzy: fuzzyInfo
+          ? { triggered: true, attempts: fuzzyInfo.attempts, confirmed: fuzzyInfo.finalOk, onTopic: fuzzyInfo.onTopic }
+          : { triggered: false },
       },
     };
   } catch (e) {
@@ -1037,7 +1306,11 @@ module.exports = {
   classifySource,
   loadConfig,
   isVagueQuery,
-  _internal: { redact, normalizeUrl, degradePayload, buildPayload, processResults, INTENT_RULES, OFFICIAL_SOURCES },
+  _internal: {
+    redact, normalizeUrl, degradePayload, buildPayload, processResults, INTENT_RULES, OFFICIAL_SOURCES,
+    detectFuzzyIdentification, assessFuzzyResults, buildFuzzyVariant, annotateCorroboration,
+    extendFuzzyIdentification, FUZZY_MAX_TAVILY_CALLS,
+  },
 };
 
 
