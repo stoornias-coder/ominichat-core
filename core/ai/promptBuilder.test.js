@@ -54,3 +54,51 @@ test('buildSystemPrompt : le bloc web est inséré avant les règles strictes', 
   assert.ok(p.indexOf('RÉSULTATS DE RECHERCHE WEB') < p.indexOf('# RÈGLES STRICTES'));
   assert.ok(!buildSystemPrompt({ character, memories, session: {}, webSearchResult: null }).includes('RECHERCHE WEB'));
 });
+
+// ═══════════════ Règles RP : autonomie du personnage joué, présence PNJ, introduction spontanée ═══════════════
+
+const memories = { global: [], session: [], character: [] };
+
+test('RP : les 3 nouvelles règles génériques sont présentes en mode personnage', () => {
+  const character = { id: 'c1', name: 'Khushi', description: '', personality: '', speaking_style: '', relationship_default: '', rules: '' };
+  const p = buildSystemPrompt({ character, memories, session: {} });
+  assert.match(p, /AUTONOMIE DU PERSONNAGE JOUÉ PAR L'UTILISATEUR/);
+  assert.match(p, /PRÉSENCE DES PERSONNAGES DANS LA SCÈNE/);
+  assert.match(p, /INTRODUCTION SPONTANÉE DE PERSONNAGES/);
+});
+
+test('RP : les 3 nouvelles règles génériques sont présentes en mode univers (isUniverse)', () => {
+  const character = { id: null, isUniverse: true, name: 'La Promesse', description: '', personality: '', speaking_style: '', relationship_default: '', rules: '' };
+  const p = buildSystemPrompt({ character, memories, session: {} });
+  assert.match(p, /AUTONOMIE DU PERSONNAGE JOUÉ PAR L'UTILISATEUR/);
+  assert.match(p, /PRÉSENCE DES PERSONNAGES DANS LA SCÈNE/);
+  assert.match(p, /INTRODUCTION SPONTANÉE DE PERSONNAGES/);
+});
+
+test('RP : les nouvelles règles sont absentes pour l\'assistant général (hors roleplay)', () => {
+  const character = { id: null, isUniverse: false, name: 'Assistant', description: '', personality: '', speaking_style: '', relationship_default: '', rules: '' };
+  const p = buildSystemPrompt({ character, memories, session: {} });
+  assert.ok(!p.includes('AUTONOMIE DU PERSONNAGE JOUÉ'));
+  assert.ok(!p.includes('PRÉSENCE DES PERSONNAGES DANS LA SCÈNE'));
+  assert.ok(!p.includes('INTRODUCTION SPONTANÉE DE PERSONNAGES'));
+  assert.ok(!p.includes('RÈGLES DE COHÉRENCE GÉNÉRIQUES'));
+});
+
+test('RP : la règle d\'autonomie ne vise que le personnage joué, pas les PNJ, et rappelle que l\'invention reste encouragée', () => {
+  const character = { id: 'c1', name: 'Arnav', description: '', personality: '', speaking_style: '', relationship_default: '', rules: '' };
+  const p = buildSystemPrompt({ character, memories, session: {} });
+  // La règle protège explicitement le personnage joué, sans interdire de faire vivre les PNJ.
+  assert.match(p, /décris librement et sans retenue tout le reste de la scène/i);
+  assert.match(p, /ne doit jamais servir de prétexte pour rendre une scène plate, passive ou trop prudente/i);
+  assert.match(p, /le canon est une fondation, pas un scénario à suivre au mot près/i);
+});
+
+test('RP : non-régression — les règles de cohérence déjà existantes restent inchangées', () => {
+  const character = { id: 'c1', name: 'Test', description: '', personality: '', speaking_style: '', relationship_default: '', rules: '' };
+  const p = buildSystemPrompt({ character, memories, session: {} });
+  assert.match(p, /Ne jamais transformer un événement déjà établi/);
+  assert.match(p, /Ne jamais confondre l'utilisateur avec une autre personne/);
+  assert.match(p, /Ne jamais changer rétroactivement qui a fait quoi à qui/);
+  assert.match(p, /Rester fidèle à la situation de départ/);
+  assert.match(p, /Garder une personnalité stable/);
+});
