@@ -848,6 +848,50 @@ function extractProperNouns(text) {
   return names;
 }
 
+/** Échappe les caractères spéciaux d'une chaîne pour l'utiliser telle quelle dans un RegExp. */
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Construit un test de correspondance à VRAIES frontières de mot pour un nom propre : "Robin" doit
+ * matcher "Robin Heiden" mais jamais une simple occurrence de "Robinson". Utilise des lookarounds
+ * (pas seulement `\b`, qui laisserait passer un nom immédiatement suivi d'une apostrophe/chiffre)
+ * sur le texte déjà normalisé (accents supprimés, minuscule) par `norm()`.
+ */
+function nameBoundaryRx(name) {
+  const n = norm(name);
+  return new RegExp(`(?<![a-z0-9])${escapeRegExp(n)}(?![a-z0-9])`, 'i');
+}
+
+/** Concatène titre + extrait + contenu brut d'un résultat en un seul texte normalisé, réutilisé par
+ *  toutes les heuristiques d'identification floue (correspondance d'indices, proximité, clustering). */
+function fuzzyResultText(r) {
+  return norm(`${r.title || ''} ${r.content || ''} ${r.rawContent || ''}`);
+}
+
+/**
+ * Parse un axe temporel raisonnable à partir du texte : "années 2000" → 2000-2009, "années 2010" →
+ * 2010-2019, "années 1990" → 1990-1999, une année précise ("en 2006") → cette seule année. Ne gère
+ * volontairement pas les formes abrégées ("les 90's") ni les plages explicites : reste "léger", et
+ * n'est jamais une condition obligatoire (voir extraAxesFor/assessFuzzyResults, qui ne l'utilisent
+ * que comme signal de cohérence, jamais comme filtre).
+ */
+function detectTimePeriod(text) {
+  const t = String(text || '');
+  let m = t.match(/\b(?:ann[eé]es?\s+)?((?:19|20)\d)0s?\b/i);
+  if (m) {
+    const decadeStart = Number(m[1] + '0');
+    return { label: `${decadeStart}s`, min: decadeStart, max: decadeStart + 9 };
+  }
+  m = t.match(/\b((?:19|20)\d{2})\b/);
+  if (m) {
+    const y = Number(m[1]);
+    return { label: String(y), min: y, max: y };
+  }
+  return null;
+}
+
 /** Fusionne des listes de noms en dédoublonnant sans tenir compte de la casse (plafond 4). */
 function mergeNames(...lists) {
   const out = [];
@@ -945,8 +989,9 @@ function extraAxesFor(fuzzyCtx) {
 
 const isFuzzyText = (t) => (FUZZY_IDENT_CUE.test(t) || FUZZY_MEMORY_CUE.test(t)) && FUZZY_WORK_TERM.test(t);
 // Gate côté message COURANT : un indice de suivi peut être un simple nom propre, sans répéter
-// "film/drama" (ex. « Robin était le patron du personnage féminin. »).
-const hasIdentificationClue = (t) => FUZZY_WORK_TERM.test(t) || !!fuzzyGeoMatch(t) || extractProperNouns(t).length > 0;
+// "film/drama" (ex. « Robin était le patron du personnage féminin. »), ou un indice purement
+// temporel (ex. « Et je crois que ça date des années 2000. »).
+const hasIdentificationClue = (t) => FUZZY_WORK_TERM.test(t) || !!fuzzyGeoMatch(t) || extractProperNouns(t).length > 0 || !!detectTimePeriod(t);
 // Gate côté message PRÉCÉDENT (contextHint) : volontairement plus strict, pour qu'un message sans
 // rapport (contenant par hasard un prénom) ne déclenche jamais l'extension à tort.
 const looksLikeContinuedIdentification = (t) => isFuzzyText(t) || (FUZZY_WORK_TERM.test(t) && !!fuzzyGeoMatch(t));
@@ -1007,38 +1052,142 @@ function detectFuzzyIdentification(message, contextHint, historyHint) {
   // concaténé, sans quoi un indice qui ouvre un message de suivi (ex. "Robin était...") se
   // retrouverait juste après un point ajouté par la concaténation et serait écarté à tort.
   const names = mergeNames(...allMessages.map((m) => extractProperNouns(m)));
+  // Axe temporel ("années 2000", "en 2006"...) : jamais obligatoire, seulement un signal de
+  // cohérence supplémentaire (voir scoreFuzzyResult) et un enrichissement de requête.
+  const time = detectTimePeriod(fullText);
 
   return {
     text: fullText, followUp,
     geoLabel: geo ? geo.label : '', geoRx: geo ? geo.rx : null,
-    format, role, language, genre, names, negated,
+    format, role, language, genre, names, negated, time,
   };
 }
 
-/** Un résultat n'est "pertinent" que s'il recoupe les indices OBLIGATOIRES fournis (géo, noms propres). */
+/** Un résultat n'est "pertinent" que s'il recoupe les indices OBLIGATOIRES fournis (géo, noms propres),
+ *  avec de vraies frontières de mot pour les noms : "Robin" ne doit jamais être considéré comme présent
+ *  dans "Robinson" (voir nameBoundaryRx). */
 function resultMatchesClues(r, fuzzyCtx) {
-  const txt = norm(`${r.title || ''} ${r.content || ''} ${r.rawContent || ''}`);
+  const txt = fuzzyResultText(r);
   if (txt.trim().length < 40) return false; // trop pauvre/générique pour confirmer quoi que ce soit
   if (fuzzyCtx.geoRx && !fuzzyCtx.geoRx.test(txt)) return false;
-  if (fuzzyCtx.names.length && !fuzzyCtx.names.some((n) => txt.includes(norm(n)))) return false;
+  if (fuzzyCtx.names.length && !fuzzyCtx.names.some((n) => nameBoundaryRx(n).test(txt))) return false;
   return true;
 }
 
-/** Parmi les indices "extras" (rôle/langue/format), ceux que ce résultat confirme déjà. */
+/** Parmi les indices "extras" (rôle/langue/format/genre), ceux que ce résultat confirme déjà. */
 function confirmedExtras(r, extras) {
   if (!extras.length) return [];
-  const txt = norm(`${r.title || ''} ${r.content || ''} ${r.rawContent || ''}`);
+  const txt = fuzzyResultText(r);
   return extras.filter((e) => e.rx.test(txt));
+}
+
+// Fiabilité de source pour la sélection de candidat flou (distincte de SOURCE_RANK, qui sert au tri
+// d'affichage) : une source primaire/institutionnelle/de référence pèse plus qu'un média généraliste,
+// qui pèse plus qu'une source non classée, qui pèse elle-même plus qu'une source communautaire isolée.
+const FUZZY_SOURCE_RELIABILITY = { official: 3, institutional: 3, reference: 3, media: 2, other: 1, community: 0 };
+function fuzzySourceReliability(r) {
+  return FUZZY_SOURCE_RELIABILITY[r.sourceType] ?? 1;
+}
+
+// Fenêtre de proximité (en caractères, texte normalisé) : au-delà, deux indices confirmés sur un même
+// résultat sont considérés "dispersés" plutôt que se rapportant au même passage descriptif. Large
+// (pas mot-à-mot) pour ne jamais pénaliser une bonne fiche qui reformule sur quelques phrases.
+const FUZZY_CLUE_PROXIMITY_WINDOW = 320;
+
+/** Positions (index caractère) de chaque indice obligatoire/extra confirmé trouvé dans le texte. */
+function clueOccurrenceIndexes(txt, fuzzyCtx, confirmed) {
+  const idxs = [];
+  if (fuzzyCtx.geoRx) { const m = fuzzyCtx.geoRx.exec(txt); if (m) idxs.push(m.index); }
+  for (const n of fuzzyCtx.names) { const m = nameBoundaryRx(n).exec(txt); if (m) idxs.push(m.index); }
+  for (const e of confirmed) { const m = e.rx.exec(txt); if (m) idxs.push(m.index); }
+  return idxs;
+}
+
+/** true si les indices trouvés sont regroupés dans une même fenêtre de texte (ou trop peu nombreux
+ *  pour juger) ; false s'ils sont dispersés aux deux extrémités d'un texte plus long et sans rapport
+ *  sémantique proche (ex. un article générique qui contient par accident tous les mots-clés). */
+function cluesAreClustered(idxs) {
+  if (idxs.length < 2) return true;
+  return (Math.max(...idxs) - Math.min(...idxs)) <= FUZZY_CLUE_PROXIMITY_WINDOW;
+}
+
+/** Signal de cohérence temporelle (jamais un filtre obligatoire) : +1 si une année mentionnée dans le
+ *  résultat tombe dans la période demandée, -1 si une année y est mentionnée mais hors période, 0 si le
+ *  résultat ne mentionne aucune année (une bonne source qui omet la date n'est jamais pénalisée). */
+function fuzzyYearConsistency(r, time) {
+  if (!time) return 0;
+  const m = `${r.title || ''} ${r.content || ''} ${r.rawContent || ''}`.match(/\b(19|20)\d{2}\b/);
+  if (!m) return 0;
+  const y = Number(m[0]);
+  return (y >= time.min && y <= time.max) ? 1 : -1;
+}
+
+/** Score de qualité global d'UN résultat pertinent, combinant fiabilité de la source, nombre d'indices
+ *  extras confirmés, proximité entre les indices, score Tavily (s'il est disponible) et cohérence
+ *  temporelle. Sert à la fois à choisir le représentant d'un cluster et, en cumulé, à comparer les
+ *  clusters entre eux — jamais à rejeter un résultat "relevant" à lui seul (voir resultMatchesClues). */
+function scoreFuzzyResult(r, fuzzyCtx, extras) {
+  const txt = fuzzyResultText(r);
+  const confirmed = confirmedExtras(r, extras);
+  const clustered = cluesAreClustered(clueOccurrenceIndexes(txt, fuzzyCtx, confirmed));
+  let score = fuzzySourceReliability(r) * 3;
+  score += confirmed.length * 2;
+  score += clustered ? 1 : -1;
+  score += fuzzyYearConsistency(r, fuzzyCtx.time);
+  if (typeof r.score === 'number') score += r.score; // poids volontairement faible face aux critères ci-dessus
+  return { confirmed, clustered, score };
+}
+
+/** Mots significatifs du titre, pour un clustering léger par recouvrement lexical (voir ci-dessous). */
+const titleClusterWords = (title) => new Set(keywords(title || ''));
+
+/**
+ * Regroupe les résultats "pertinents" qui semblent parler de la même œuvre : forte intersection de
+ * mots significatifs de titre (coefficient de recouvrement, tolérant aux suffixes différents d'un
+ * site à l'autre : "(2006)", "- IMDb", "- Wikipedia"...). Volontairement léger : pas de titre extrait
+ * du contenu, pas de similarité sémantique — seulement titre normalisé + intersection de mots + domaine
+ * (pour mesurer la corroboration indépendante). "Plusieurs sources cohérentes sur la même œuvre" (un
+ * même cluster, plusieurs domaines) doivent l'emporter sur "une source isolée et ambiguë" (cluster à
+ * un seul élément) — voir le score de cluster plus bas.
+ */
+function clusterRelevantResults(relevant) {
+  const clusters = [];
+  for (const r of relevant) {
+    const words = titleClusterWords(r.title);
+    let best = null;
+    let bestSim = 0;
+    for (const c of clusters) {
+      if (!words.size || !c.words.size) continue;
+      let inter = 0;
+      for (const w of words) if (c.words.has(w)) inter++;
+      const sim = inter / Math.min(words.size, c.words.size); // coefficient de recouvrement
+      if (inter >= 2 && sim >= 0.5 && sim > bestSim) { best = c; bestSim = sim; }
+    }
+    if (best) {
+      best.items.push(r);
+      for (const w of words) best.words.add(w);
+      best.domains.add(r.domain);
+    } else {
+      clusters.push({ items: [r], words, domains: new Set([r.domain]) });
+    }
+  }
+  return clusters;
 }
 
 /**
  * Évalue un lot de résultats contre les indices de l'identification floue, en distinguant
- * explicitement : "résultat pertinent" (indices obligatoires respectés) → "candidat potentiel"
- * (+ au moins un indice extra discriminant confirmé, s'il en existe) → "identification suffisamment
- * étayée" (ok:true, seulement quand TOUS les indices extras sont confirmés). Un résultat qui ne
- * recoupe que les indices obligatoires (ex. "Robin + coréen") ne suffit donc plus dès lors que des
- * indices extras discriminants existent (ex. "patron" + "anglais") et ne sont pas encore confirmés —
- * volontairement en conditions booléennes simples, sans score numérique.
+ * explicitement : "résultats pertinents" (indices obligatoires respectés, avec de vraies frontières
+ * de mot) → regroupés en clusters par œuvre probable → "candidat" (le cluster de meilleure qualité
+ * globale, pas simplement le premier résultat individuel trouvé) → "identification suffisamment
+ * étayée" (ok:true, seulement quand tous les indices extras sont confirmés PAR le cluster gagnant).
+ *
+ * La qualité d'un cluster combine : fiabilité de chaque source, indices extras confirmés (cumulés sur
+ * l'ensemble du cluster — plusieurs sources qui confirment chacune une partie des indices sur la même
+ * œuvre valent une identification complète), proximité des indices, score Tavily, et un bonus de
+ * corroboration quand le cluster est confirmé par plusieurs domaines indépendants. Une source
+ * communautaire strictement isolée (un seul résultat, un seul domaine, fiabilité minimale) ne peut
+ * jamais, à elle seule, faire passer l'identification à "confirmée" : elle reste un candidat plausible
+ * en attente d'une confirmation indépendante (voir soleWeakSource ci-dessous).
  * @returns {{ok:boolean, onTopic:number, candidate:object|null, unconfirmedExtras:object[], extras:object[]}}
  */
 function assessFuzzyResults(results, fuzzyCtx) {
@@ -1046,25 +1195,44 @@ function assessFuzzyResults(results, fuzzyCtx) {
   const relevant = results.filter((r) => resultMatchesClues(r, fuzzyCtx));
   if (!relevant.length) return { ok: false, onTopic: 0, candidate: null, unconfirmedExtras: extras, extras };
 
-  // Candidat = meilleur résultat pertinent, celui qui confirme le plus d'indices extras.
-  let candidate = null;
-  let candidateExtras = [];
-  for (const r of relevant) {
-    const c = confirmedExtras(r, extras);
-    if (!candidate || c.length > candidateExtras.length) { candidate = r; candidateExtras = c; }
+  const clusters = clusterRelevantResults(relevant);
+
+  let winner = null;
+  for (const c of clusters) {
+    const evals = c.items.map((r) => ({ r, ...scoreFuzzyResult(r, fuzzyCtx, extras) }));
+    const confirmedLabels = new Set();
+    for (const e of evals) for (const cf of e.confirmed) confirmedLabels.add(cf.label);
+    const best = evals.reduce((a, b) => (b.score >= a.score ? b : a));
+    const independentDomains = c.domains.size;
+    // Plusieurs sources cohérentes (domaines distincts) sur la même œuvre corroborent réellement le
+    // cluster ; une source isolée, même contenant tous les mots-clés, n'obtient jamais ce bonus.
+    const corroborationBonus = independentDomains > 1 ? 2 : 0;
+    const soleWeakSource = c.items.length === 1 && independentDomains === 1 && fuzzySourceReliability(best.r) === 0;
+    const candidate = { representative: best.r, confirmedLabels, soleWeakSource, score: best.score + corroborationBonus };
+    if (!winner || candidate.score > winner.score) winner = candidate;
   }
-  const isCandidate = extras.length === 0 || candidateExtras.length > 0;
+
+  const { representative, confirmedLabels, soleWeakSource } = winner;
+  const isCandidate = extras.length === 0 || confirmedLabels.size > 0;
   if (!isCandidate) return { ok: false, onTopic: relevant.length, candidate: null, unconfirmedExtras: extras, extras };
 
-  const confirmedLabels = new Set(candidateExtras.map((e) => e.label));
-  const unconfirmedExtras = extras.filter((e) => !confirmedLabels.has(e.label));
-  return { ok: unconfirmedExtras.length === 0, onTopic: relevant.length, candidate, unconfirmedExtras, extras };
+  let unconfirmedExtras = extras.filter((e) => !confirmedLabels.has(e.label));
+  let ok = unconfirmedExtras.length === 0;
+  if (soleWeakSource && extras.length > 0) {
+    // Une source communautaire isolée ne suffit jamais seule : on exige une confirmation indépendante
+    // (une requête de vérification supplémentaire ciblera alors les indices, même déjà "lus" ici).
+    ok = false;
+    if (!unconfirmedExtras.length) unconfirmedExtras = extras.slice();
+  }
+
+  return { ok, onTopic: relevant.length, candidate: representative, unconfirmedExtras, extras };
 }
 
 /** Reformulation déterministe (sans dépendance payante) : indices connus + angle de recherche différent. */
 function buildFuzzyVariant(fuzzyCtx, tried, attemptNo) {
   const extraLabels = extraAxesFor(fuzzyCtx).map((e) => e.label);
-  const base = [fuzzyCtx.geoLabel, ...fuzzyCtx.names, ...extraLabels].filter(Boolean).join(' ').trim();
+  const timeLabel = fuzzyCtx.time ? fuzzyCtx.time.label : '';
+  const base = [fuzzyCtx.geoLabel, ...fuzzyCtx.names, ...extraLabels, timeLabel].filter(Boolean).join(' ').trim();
   if (!base) return null;
   // Suffixe générique volontairement neutre : il ne doit jamais réintroduire un terme qui pourrait
   // correspondre à un label niable (ex. "drama"), sans quoi une correction explicite de l'utilisateur
@@ -1087,7 +1255,8 @@ function buildFuzzyVariant(fuzzyCtx, tried, attemptNo) {
  *  candidat au lieu de le confronter aux indices d'origine. */
 function buildFuzzyVerification(fuzzyCtx, verdict, tried) {
   if (!verdict.candidate || !verdict.unconfirmedExtras.length) return null;
-  const baseLabels = [fuzzyCtx.geoLabel, ...fuzzyCtx.format.map((f) => f.label)].filter(Boolean);
+  const timeLabel = fuzzyCtx.time ? fuzzyCtx.time.label : '';
+  const baseLabels = [fuzzyCtx.geoLabel, ...fuzzyCtx.format.map((f) => f.label), timeLabel].filter(Boolean);
   const baseText = baseLabels.join(' ');
   const extrasText = verdict.unconfirmedExtras.map((e) => e.label).join(' ');
   const namesText = fuzzyCtx.names.join(' ');
@@ -1569,7 +1738,8 @@ module.exports = {
     extendFuzzyIdentification, FUZZY_MAX_TAVILY_CALLS, FUZZY_MAX_HISTORY, isRedundantQuery,
     extractNegatedClues, extractAxisMatches, extractSpokenLanguage, pickActiveGeo, extraAxesFor,
     FUZZY_GEO_TABLE, FUZZY_FORMAT_TABLE, FUZZY_ROLE_TABLE, FUZZY_LANGUAGE_TABLE, FUZZY_GENRE_TABLE,
-    buildFuzzyVerification,
+    buildFuzzyVerification, resultMatchesClues, confirmedExtras, nameBoundaryRx, detectTimePeriod,
+    clusterRelevantResults, scoreFuzzyResult,
   },
 };
 
