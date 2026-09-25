@@ -706,3 +706,129 @@ test('M. question précise avec indices extras dans la question elle-même : auc
   assert.equal(n, 1, 'question précise => une seule requête Tavily, jamais 3');
   assert.equal(r.meta.fuzzy.triggered, false);
 });
+
+// ═══════════════ R/S/T : buildFuzzyVerification reste ancré sur les indices utilisateur ═══════════════
+// Reproduit le bug réel observé en production : la requête de "vérification" (3e requête) se
+// construisait uniquement à partir du titre du candidat trouvé, faisant disparaître le filtre
+// géo/format posé par l'utilisateur — au lieu de vérifier le candidat CONTRE ces indices.
+
+test('R. buildFuzzyVerification conserve geoLabel et le format en plus du candidat et des extras', () => {
+  const fuzzyCtx = ws._internal.detectFuzzyIdentification(ROBIN_FULL, null);
+  const verdict = {
+    candidate: { title: 'Some Random Title', url: 'https://example.org/x' },
+    unconfirmedExtras: [{ label: 'English', rx: /english/i }],
+  };
+  const q = ws._internal.buildFuzzyVerification(fuzzyCtx, verdict, ['already tried query']);
+  assert.ok(q, 'une requête de vérification est bien construite');
+  assert.match(q, /korean/i, 'le contexte géographique utilisateur reste présent');
+  assert.match(q, /film/i, 'le format utilisateur reste présent');
+  assert.match(q, /some random title/i, 'le titre du candidat reste présent');
+  assert.match(q, /english/i, "l'indice extra encore non confirmé reste présent");
+});
+
+test('S. un candidat hors-sujet ne peut jamais faire disparaître les contraintes géo/format initiales', () => {
+  const fuzzyCtx = ws._internal.detectFuzzyIdentification(ROBIN_FULL, null);
+  // Titre du candidat volontairement sans aucun rapport textuel avec "korean" / "film".
+  const verdict = {
+    candidate: { title: "Trespass (2011) | VERN'S REVIEWS", url: 'https://example.org/trespass' },
+    unconfirmedExtras: [{ label: 'boss', rx: /boss/i }, { label: 'English', rx: /english/i }],
+  };
+  const q = ws._internal.buildFuzzyVerification(fuzzyCtx, verdict, []);
+  assert.match(q, /korean/i, 'le candidat ne fait pas disparaître le filtre géo');
+  assert.match(q, /film/i, 'le candidat ne fait pas disparaître le filtre format');
+  assert.match(q, /trespass/i, 'le candidat reste bien présent dans la requête');
+});
+
+test('T. intégration : la requête de vérification reste ancrée sur les indices utilisateur même si le candidat est un résultat hors-sujet', async () => {
+  const queries = [];
+  const fetchImpl = async (u, init) => {
+    const q = JSON.parse(init.body).query;
+    queries.push(q);
+    if (queries.length === 1) {
+      return mkRes(200, okBody([
+        { title: 'Films populaires 2023', url: 'https://allocine.fr/films/populaires', content: 'Liste de films sortis récemment, tous pays confondus, sans lien avec la demande.', score: 0.5 },
+      ]));
+    }
+    if (queries.length === 2) {
+      // Résultat faiblement pertinent : recoupe Korea + Robin + "English" par coïncidence, sur une
+      // page dont le sujet réel n'a rien à voir (cf. bug réel observé en production).
+      return mkRes(200, okBody([
+        { title: "Trespass (2011) | VERN'S REVIEWS", url: 'https://example.org/trespass', content: 'A generic English-language review mentioning Robin in passing, filmed partly in Korea for a scene.', score: 0.4 },
+      ]));
+    }
+    assert.match(q, /korean/i, 'la requête de vérification garde le contexte géo utilisateur');
+    assert.match(q, /film/i, 'la requête de vérification garde le format utilisateur');
+    return mkRes(200, okBody([]));
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  await ws.searchWeb(ROBIN_FULL, o);
+  assert.equal(queries.length, 3, 'exactement 3 requêtes : initiale, candidat, vérification');
+});
+
+// ═══════════════ U/V : FUZZY_GENRE_TABLE — un suivi court enrichit bien le genre ═══════════════
+
+test('U. suivi court "C\'est une romance coréenne." enrichit le contexte précédent avec le genre "romance"', () => {
+  const ctx = ws._internal.detectFuzzyIdentification("C'est une romance coréenne.", null, [ROBIN_FULL]);
+  assert.ok(ctx, 'le suivi est bien rattaché à la séquence précédente');
+  assert.equal(ctx.geoLabel, 'korean');
+  assert.ok(ctx.names.some((n) => n.toLowerCase() === 'robin'), 'le nom du message précédent reste présent');
+  assert.ok(ctx.role.some((r) => r.label === 'boss'), "le rôle du message précédent ('boss') reste présent");
+  assert.ok(ctx.language.some((l) => l.label === 'English'), 'la langue du message précédent reste présente');
+  assert.ok(ctx.genre.some((g) => g.label === 'romance'), 'le genre "romance" du message de suivi est bien capté');
+});
+
+test('V. un autre genre (thriller) est également reconnu et enrichit le contexte', () => {
+  const ctx = ws._internal.detectFuzzyIdentification('C\'est plutôt un thriller coréen.', null, [ROBIN_FULL]);
+  assert.ok(ctx);
+  assert.ok(ctx.genre.some((g) => g.label === 'thriller'), 'le genre "thriller" est bien capté');
+  assert.ok(ctx.names.some((n) => n.toLowerCase() === 'robin'), 'les indices précédents restent fusionnés');
+});
+
+test('U2. le genre enrichit bien extraAxesFor (donc les requêtes de reformulation/vérification)', () => {
+  const ctx = ws._internal.detectFuzzyIdentification("C'est une romance coréenne.", null, [ROBIN_FULL]);
+  const extras = ws._internal.extraAxesFor(ctx);
+  assert.ok(extras.some((e) => e.label === 'romance'), 'le genre fait bien partie des indices extras pris en compte');
+});
+
+// ═══════════════ W/X/Y : non-régression ═══════════════
+
+test('W. non-régression : une recherche non-floue n\'est pas affectée par les tables de genre', async () => {
+  let n = 0;
+  const fetchImpl = async () => {
+    n++;
+    return mkRes(200, okBody([
+      { title: 'Météo Paris', url: 'https://meteo-paris.com', content: "Ensoleillé, 22°C à Paris aujourd'hui.", score: 0.6 },
+    ]));
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  const r = await ws.searchWeb("Quel temps fait-il à Paris aujourd'hui ?", o);
+  assert.equal(n, 1, 'une recherche non-floue reste une seule requête Tavily');
+  assert.equal(r.meta.fuzzy.triggered, false);
+});
+
+test('X. isRedundantQuery et le plafond de 3 requêtes restent inchangés en présence d\'un indice de genre', async () => {
+  const tried = [ROBIN_FULL];
+  assert.equal(ws._internal.isRedundantQuery(ROBIN_FULL, tried), true);
+  assert.equal(ws._internal.isRedundantQuery('korean romance Robin boss English film movie title character cast', tried), false);
+
+  let n = 0;
+  const fetchImpl = async () => {
+    n++;
+    return mkRes(200, okBody([
+      { title: 'Hors sujet', url: 'https://example.org/x', content: 'Contenu générique sans rapport avec les indices demandés du tout.', score: 0.4 },
+    ]));
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  await ws.searchWeb("Il y a un film coréen romantique où le personnage masculin principal s'appelle Robin mais j'ai oublié le titre.", o);
+  assert.ok(n <= 3, `au plus 3 requêtes Tavily, obtenu ${n}`);
+});
+
+test("Y. aucun titre/personnage/œuvre n'est câblé en dur : la détection fonctionne avec un nom totalement inédit", () => {
+  const ctx = ws._internal.detectFuzzyIdentification(
+    "Il y a un film coréen où Zorbaxel est la patronne du personnage principal, elle parle souvent anglais, mais j'ai oublié le titre.",
+    null,
+  );
+  assert.ok(ctx);
+  assert.ok(ctx.names.includes('Zorbaxel'), "un nom propre jamais vu fonctionne, preuve qu'aucune liste de titres/personnages n'est en dur");
+  assert.equal(ctx.geoLabel, 'korean');
+});
