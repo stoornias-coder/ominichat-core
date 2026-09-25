@@ -797,6 +797,21 @@ const FUZZY_LANGUAGE_TABLE = [
   { src: /\b(chinois(?:e)?|chinese|mandarin)\b/i, label: 'Chinese', rx: /\bchinese\b|mandarin|chinois/i },
   { src: /\b(espagnol(?:e)?|spanish)\b/i, label: 'Spanish', rx: /\bspanish\b|espagnol/i },
 ];
+// Genre narratif : distinct du format ci-dessus (le format décrit le SUPPORT — film/série/drama —,
+// le genre décrit le SUJET/TON de l'œuvre). Même modèle que les autres tables : purement dérivé du
+// texte de l'utilisateur, jamais de titre/œuvre en dur. Permet à un message de suivi court comme
+// « C'est une romance coréenne » d'enrichir réellement les indices déjà établis (voir extraAxesFor).
+const FUZZY_GENRE_TABLE = [
+  { src: /\b(romance|romantique|romantic)\b/i, label: 'romance', rx: /\bromance\b|romantic|romantique/i },
+  { src: /\bthrillers?\b/i, label: 'thriller', rx: /\bthrillers?\b/i },
+  { src: /\b(com[eé]die|comedy|humoristique)\b/i, label: 'comedy', rx: /\bcomedy\b|com[eé]die/i },
+  { src: /\b(horreur|horror|[eé]pouvante)\b/i, label: 'horror', rx: /\bhorror\b|horreur|[eé]pouvante/i },
+  { src: /\baction\b/i, label: 'action', rx: /\baction\b/i },
+  { src: /\b(drame|dramatique)\b/i, label: 'drama-genre', rx: /\bdrame\b|dramatique/i },
+  { src: /\b(fantastique|fantasy)\b/i, label: 'fantasy', rx: /\bfantasy\b|fantastique/i },
+  { src: /\b(science.?fiction|sci.?fi)\b/i, label: 'sci-fi', rx: /science.?fiction|sci.?fi/i },
+  { src: /\b(policier|crime|polar)\b/i, label: 'crime', rx: /\bcrime\b|policier|\bpolar\b/i },
+];
 // Contradiction explicite ("pas un drama", "not a K-drama", "ce n'est pas un acteur") : une correction
 // de l'utilisateur a toujours priorité sur un indice positif antérieur, quelle que soit la table concernée.
 const FUZZY_NEGATION_CUE_RX = /\b(?:pas|not|isn['’]t|ain['’]t|n['’]est\s+pas)\b([^.!?,]{0,30})/gi;
@@ -909,7 +924,7 @@ function extractSpokenLanguage(text, negatedSet) {
 
 /** Indices explicitement niés ("pas un drama", "not a K-drama", "ce n'est pas japonais"...), par axe. */
 function extractNegatedClues(text) {
-  const negated = { geo: new Set(), format: new Set(), role: new Set(), language: new Set() };
+  const negated = { geo: new Set(), format: new Set(), role: new Set(), language: new Set(), genre: new Set() };
   const rx = new RegExp(FUZZY_NEGATION_CUE_RX.source, 'gi');
   let m;
   while ((m = rx.exec(text))) {
@@ -918,13 +933,14 @@ function extractNegatedClues(text) {
     for (const e of FUZZY_FORMAT_TABLE) if (e.src.test(window)) negated.format.add(e.label);
     for (const e of FUZZY_ROLE_TABLE) if (e.src.test(window)) negated.role.add(e.label);
     for (const e of FUZZY_LANGUAGE_TABLE) if (e.src.test(window)) negated.language.add(e.label);
+    for (const e of FUZZY_GENRE_TABLE) if (e.src.test(window)) negated.genre.add(e.label);
   }
   return negated;
 }
 
-/** Indices "extras" (discriminants au-delà du géo/nom obligatoires) : rôle, langue parlée, format. */
+/** Indices "extras" (discriminants au-delà du géo/nom obligatoires) : rôle, langue parlée, format, genre. */
 function extraAxesFor(fuzzyCtx) {
-  return [...fuzzyCtx.role, ...fuzzyCtx.language, ...fuzzyCtx.format];
+  return [...fuzzyCtx.role, ...fuzzyCtx.language, ...fuzzyCtx.format, ...fuzzyCtx.genre];
 }
 
 const isFuzzyText = (t) => (FUZZY_IDENT_CUE.test(t) || FUZZY_MEMORY_CUE.test(t)) && FUZZY_WORK_TERM.test(t);
@@ -953,7 +969,7 @@ const looksLikeContinuedIdentification = (t) => isFuzzyText(t) || (FUZZY_WORK_TE
  * Retourne null si le message est une question précise ou sans rapport : searchWeb() garde alors son
  * comportement normal à une seule requête (non-régression).
  * @returns {null|{text:string, followUp:boolean, geoLabel:string, geoRx:RegExp|null, names:string[],
- *   format:{label,rx}[], role:{label,rx}[], language:{label,rx}[], negated:object}}
+ *   format:{label,rx}[], role:{label,rx}[], language:{label,rx}[], genre:{label,rx}[], negated:object}}
  */
 function detectFuzzyIdentification(message, contextHint, historyHint) {
   const q = cleanText(String(message ?? ''));
@@ -986,6 +1002,7 @@ function detectFuzzyIdentification(message, contextHint, historyHint) {
   const format = extractAxisMatches(fullText, FUZZY_FORMAT_TABLE, negated.format);
   const role = extractAxisMatches(fullText, FUZZY_ROLE_TABLE, negated.role);
   const language = extractSpokenLanguage(fullText, negated.language);
+  const genre = extractAxisMatches(fullText, FUZZY_GENRE_TABLE, negated.genre);
   // Les noms sont extraits séparément de CHAQUE message puis fusionnés — jamais depuis le texte
   // concaténé, sans quoi un indice qui ouvre un message de suivi (ex. "Robin était...") se
   // retrouverait juste après un point ajouté par la concaténation et serait écarté à tort.
@@ -994,7 +1011,7 @@ function detectFuzzyIdentification(message, contextHint, historyHint) {
   return {
     text: fullText, followUp,
     geoLabel: geo ? geo.label : '', geoRx: geo ? geo.rx : null,
-    format, role, language, names, negated,
+    format, role, language, genre, names, negated,
   };
 }
 
@@ -1061,12 +1078,20 @@ function buildFuzzyVariant(fuzzyCtx, tried, attemptNo) {
 
 /** 3e requête de "vérification" d'un candidat : son titre extrait dynamiquement des résultats
  *  (jamais en dur) + les indices extras encore non confirmés + les noms, pour trancher explicitement
- *  entre candidat et identification. */
+ *  entre candidat et identification.
+ *  Les contraintes de base posées par l'utilisateur (géo/nationalité + format) sont TOUJOURS
+ *  réinjectées ici, même si le candidat les a déjà "implicitement" satisfaites lors de sa sélection :
+ *  cette requête doit vérifier le candidat CONTRE les indices utilisateur, jamais s'y substituer.
+ *  Sans ça, un candidat trouvé par coïncidence sur une recherche large ferait disparaître le filtre
+ *  géo/format initial dès la requête suivante, et la vérification ne ferait plus que renforcer ce
+ *  candidat au lieu de le confronter aux indices d'origine. */
 function buildFuzzyVerification(fuzzyCtx, verdict, tried) {
   if (!verdict.candidate || !verdict.unconfirmedExtras.length) return null;
+  const baseLabels = [fuzzyCtx.geoLabel, ...fuzzyCtx.format.map((f) => f.label)].filter(Boolean);
+  const baseText = baseLabels.join(' ');
   const extrasText = verdict.unconfirmedExtras.map((e) => e.label).join(' ');
   const namesText = fuzzyCtx.names.join(' ');
-  const candidate = cleanText(`${verdict.candidate.title} ${namesText} ${extrasText}`);
+  const candidate = cleanText(`${verdict.candidate.title} ${baseText} ${namesText} ${extrasText}`);
   const seen = (q) => tried.some((t) => norm(t) === norm(q));
   if (!candidate || seen(candidate)) return null;
   return candidate;
@@ -1543,7 +1568,8 @@ module.exports = {
     detectFuzzyIdentification, assessFuzzyResults, buildFuzzyVariant, buildFuzzyVerification, annotateCorroboration,
     extendFuzzyIdentification, FUZZY_MAX_TAVILY_CALLS, FUZZY_MAX_HISTORY, isRedundantQuery,
     extractNegatedClues, extractAxisMatches, extractSpokenLanguage, pickActiveGeo, extraAxesFor,
-    FUZZY_GEO_TABLE, FUZZY_FORMAT_TABLE, FUZZY_ROLE_TABLE, FUZZY_LANGUAGE_TABLE,
+    FUZZY_GEO_TABLE, FUZZY_FORMAT_TABLE, FUZZY_ROLE_TABLE, FUZZY_LANGUAGE_TABLE, FUZZY_GENRE_TABLE,
+    buildFuzzyVerification,
   },
 };
 
