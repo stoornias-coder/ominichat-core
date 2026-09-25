@@ -312,3 +312,176 @@ test('redact : clés et tokens masqués, y compris dans les objets imbriqués', 
   const s = JSON.stringify(out);
   assert.ok(!s.includes('abc') && !s.includes('xyz12345678') && !s.includes(FAKE_KEY));
 });
+
+// ═══════════════ Identification d'œuvre floue (recherche adaptative) — tests A à G ═══════════════
+
+test('A. identification floue : dépasse la 1re recherche si les résultats sont insuffisants', async () => {
+  const queries = [];
+  const fetchImpl = async (u, init) => {
+    const body = JSON.parse(init.body);
+    queries.push(body.query);
+    if (queries.length === 1) {
+      // 1er passage : des résultats existent, mais aucun ne recoupe les indices (pas de "Robin"/"korea").
+      return mkRes(200, okBody([
+        { title: 'Films populaires 2023', url: 'https://allocine.fr/films/populaires', content: 'Liste de films sortis récemment, tous pays confondus, sans lien avec la demande.', score: 0.5 },
+      ]));
+    }
+    // Reformulation suivante : résultat qui recoupe enfin les indices.
+    return mkRes(200, okBody([
+      { title: 'Boss in the Mirror — cast', url: 'https://mydramalist.com/boss-in-the-mirror', content: 'Korean movie. Robin is the male lead character, the boss of the female lead.', score: 0.6 },
+    ]));
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  const r = await ws.searchWeb("Il y a un film coréen où le personnage masculin principal s'appelle Robin mais j'ai oublié le titre.", o);
+
+  assert.ok(queries.length >= 2, 'une requête supplémentaire a bien été déclenchée');
+  assert.ok(queries.length <= 3, 'jamais plus de 3 requêtes Tavily au total');
+  assert.equal(r.meta.fuzzy.triggered, true);
+  assert.equal(r.meta.fuzzy.confirmed, true);
+  assert.ok(r.results.some((x) => /mydramalist/.test(x.domain)), 'le résultat pertinent trouvé en 2e passage est bien conservé');
+});
+
+test('A bis. identification floue : ne prolonge pas si le 1er passage est déjà concluant', async () => {
+  const queries = [];
+  const fetchImpl = async (u, init) => {
+    queries.push(JSON.parse(init.body).query);
+    return mkRes(200, okBody([
+      { title: 'Boss in the Mirror — cast', url: 'https://mydramalist.com/boss-in-the-mirror', content: 'Korean movie. Robin is the male lead character.', score: 0.6 },
+    ]));
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  const r = await ws.searchWeb("Il y a un film coréen où le personnage masculin principal s'appelle Robin mais j'ai oublié le titre.", o);
+  assert.equal(queries.length, 1, 'un seul appel Tavily suffit puisque le 1er résultat recoupe déjà les indices');
+  assert.equal(r.meta.fuzzy.confirmed, true);
+});
+
+test('B. suivi court : conserve les indices précédents (ex. "Robin")', () => {
+  const prev = "Il y a un film coréen où le personnage masculin principal s'appelle Robin mais j'ai oublié le titre.";
+  const ctx = ws._internal.detectFuzzyIdentification("C'est un film coréen, pas un drama.", prev);
+  assert.ok(ctx, 'le suivi est reconnu comme la continuation d\'une identification floue');
+  assert.equal(ctx.followUp, true);
+  assert.equal(ctx.geoLabel, 'korean');
+  assert.ok(ctx.names.includes('Robin'), 'l\'indice "Robin" du message précédent est conservé');
+});
+
+test('B bis. suivi court : la recherche envoyée à Tavily porte bien les indices fusionnés', async () => {
+  const queries = [];
+  const fetchImpl = async (u, init) => {
+    queries.push(JSON.parse(init.body).query);
+    return mkRes(200, okBody([])); // volontairement vide : force l'extension pour observer les requêtes envoyées
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true, contextHint: "Il y a un film coréen où le personnage masculin principal s'appelle Robin mais j'ai oublié le titre." });
+  await ws.searchWeb("C'est un film coréen, pas un drama.", o);
+  assert.ok(queries.some((q) => /robin/i.test(q)), '"Robin" apparaît dans au moins une des requêtes envoyées');
+  assert.ok(queries.length <= 3);
+});
+
+test('C. indice supplémentaire : s\'intègre à la recherche suivante', () => {
+  const prev = "C'est un film coréen, pas un drama.";
+  const ctx = ws._internal.detectFuzzyIdentification('Robin était le patron du personnage féminin et il parlait toujours anglais.', prev);
+  assert.ok(ctx, 'reconnu comme un suivi d\'identification floue malgré l\'absence de "film/drama" dans ce message');
+  assert.equal(ctx.followUp, true);
+  assert.equal(ctx.geoLabel, 'korean');
+  assert.ok(ctx.names.includes('Robin'), 'le nom en tête du message de suivi est bien capté');
+});
+
+test('D. question précise : une seule recherche, pas d\'extension', async () => {
+  let n = 0;
+  const fetchImpl = async (u, init) => {
+    n++;
+    return mkRes(200, okBody([
+      { title: 'Seducing Mr. Perfect - Cast', url: 'https://mydramalist.com/seducing-mr-perfect', content: 'Robin est interprété par un acteur dans Seducing Mr. Perfect.', score: 0.6 },
+    ]));
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  const r = await ws.searchWeb('Qui joue Robin dans Seducing Mr. Perfect ?', o);
+  assert.equal(n, 1, 'question précise => une seule requête Tavily, jamais 3');
+  assert.equal(r.meta.fuzzy.triggered, false);
+});
+
+test('E. RP fanfic : récupère le contexte de l\'œuvre sans déclencher l\'extension floue', async () => {
+  let n = 0;
+  const fetchImpl = async (u, init) => {
+    n++;
+    return mkRes(200, okBody([
+      { title: 'La Promesse - personnages', url: 'https://fr.wikipedia.org/wiki/La_Promesse_(telenovela)', content: 'La Promesse est une telenovela indienne. Khushi et Arnav sont les personnages principaux.', score: 0.6 },
+      { title: 'Fan forum - La Promesse', url: 'https://reddit.com/r/laPromesse/x', content: 'Discussion de fans sur les personnages secondaires.', score: 0.3 },
+    ]));
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  const r = await ws.searchWeb('Je veux faire un RP dans La Promesse. Je joue Khushi. Fais intervenir les personnages de la série en respectant leurs personnalités et les événements connus.', o);
+  assert.equal(n, 1, 'ce n\'est pas une identification floue (le titre est connu) : pas d\'extension');
+  assert.equal(r.meta.fuzzy.triggered, false);
+  assert.ok(r.results.length > 0);
+  // Anti-hallucination : la source communautaire isolée (reddit, non recoupée ici) est marquée "weak"
+  // avec une réserve explicite, sans être supprimée ni présentée comme un fait établi.
+  const reddit = r.results.find((x) => /reddit/.test(x.domain));
+  if (reddit) {
+    assert.equal(reddit.corroboration, 'weak');
+    assert.match(reddit.content, /à traiter avec prudence/);
+  }
+});
+
+test('F. conversation RP normale : aucune recherche supplémentaire imposée par le simple fait d\'être en RP', () => {
+  const ctx = ws._internal.detectFuzzyIdentification("*il s'assoit à côté de toi* Comment vas-tu aujourd'hui ?", undefined);
+  assert.equal(ctx, null, 'un message RP ordinaire ne déclenche jamais la détection floue');
+});
+
+test('G. non-régression : les recherches normales existantes continuent de fonctionner comme avant', async () => {
+  let n = 0;
+  const fetchImpl = async () => { n++; return mkRes(200, okBody([{ title: 'Doc', url: 'https://console.groq.com/docs', content: 'groq doc', score: 0.5 }])); };
+  const { o } = opts(fetchImpl);
+  const r = await ws.searchWeb('Quels sont les modèles Groq disponibles ?', o);
+  assert.equal(n, 1);
+  assert.equal(r.ok, true);
+  assert.equal(r.meta.fuzzy.triggered, false);
+});
+
+// ─────────────── Anti-hallucination : corroboration en 3 niveaux ───────────────
+
+test('corroboration : source unique primaire/fiable => "strong", jamais pénalisée', () => {
+  const kept = [{ domain: 'mydramalist.com', sourceType: 'reference', authoritative: false, content: 'Contenu de référence.' }];
+  ws._internal.annotateCorroboration(kept, {});
+  assert.equal(kept[0].corroboration, 'strong');
+  assert.equal(kept[0].content, 'Contenu de référence.', 'aucune note ajoutée : une source primaire seule n\'est pas affaiblie');
+});
+
+test('corroboration : source unique non primaire => "weak", avec réserve explicite', () => {
+  const kept = [{ domain: 'reddit.com', sourceType: 'community', authoritative: false, content: 'Un fan affirme que X est le frère de Y.' }];
+  ws._internal.annotateCorroboration(kept, {});
+  assert.equal(kept[0].corroboration, 'weak');
+  assert.match(kept[0].content, /^\[Source unique et non primaire/);
+});
+
+test('corroboration : deux sources indépendantes qui se recoupent réellement => "strong" même non primaires', () => {
+  const kept = [
+    { domain: 'reddit.com', sourceType: 'community', authoritative: false, content: 'Le film coréen Boss in the Mirror met en scène un personnage nommé Robin, patron du personnage féminin.' },
+    { domain: 'somefanblog.example', sourceType: 'other', authoritative: false, content: "Boss in the Mirror, film coréen, présente un personnage nommé Robin qui est le patron de l'héroïne." },
+  ];
+  ws._internal.annotateCorroboration(kept, {});
+  assert.deepEqual(kept.map((r) => r.corroboration), ['strong', 'strong']);
+});
+
+test('corroboration : deux sources non primaires mais SANS rapport de sujet => chacune reste "weak"', () => {
+  const kept = [
+    { domain: 'reddit.com', sourceType: 'community', authoritative: false, content: 'Un fan affirme que X est le frère de Y dans une toute autre discussion.' },
+    { domain: 'somefanblog.example', sourceType: 'other', authoritative: false, content: 'Un article sans rapport sur un tout autre sujet, une recette de cuisine par exemple.' },
+  ];
+  ws._internal.annotateCorroboration(kept, {});
+  assert.deepEqual(kept.map((r) => r.corroboration), ['weak', 'weak']);
+});
+
+test('corroboration : identification floue jamais confirmée => "unverifiable" pour tout le lot', () => {
+  const kept = [{ domain: 'allocine.fr', sourceType: 'reference', authoritative: false, content: 'Résultat non concluant.' }];
+  ws._internal.annotateCorroboration(kept, { forceUnverifiable: true });
+  assert.equal(kept[0].corroboration, 'unverifiable');
+  assert.match(kept[0].content, /Identification non confirmée/);
+});
+
+test('extension floue : budget épuisé => pas de requête Tavily supplémentaire au-delà de 3', async () => {
+  let n = 0;
+  const fetchImpl = async () => { n++; return mkRes(200, okBody([{ title: 'Hors sujet', url: 'https://example.org/x', content: 'Contenu générique sans rapport avec les indices demandés du tout.', score: 0.4 }])); };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  await ws.searchWeb("Il y a un film coréen où le personnage masculin principal s'appelle Robin mais j'ai oublié le titre.", o);
+  assert.ok(n <= 3, `au plus 3 requêtes Tavily, obtenu ${n}`);
+});
