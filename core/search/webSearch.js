@@ -992,9 +992,43 @@ const isFuzzyText = (t) => (FUZZY_IDENT_CUE.test(t) || FUZZY_MEMORY_CUE.test(t))
 // "film/drama" (ex. « Robin était le patron du personnage féminin. »), ou un indice purement
 // temporel (ex. « Et je crois que ça date des années 2000. »).
 const hasIdentificationClue = (t) => FUZZY_WORK_TERM.test(t) || !!fuzzyGeoMatch(t) || extractProperNouns(t).length > 0 || !!detectTimePeriod(t);
-// Gate côté message PRÉCÉDENT (contextHint) : volontairement plus strict, pour qu'un message sans
-// rapport (contenant par hasard un prénom) ne déclenche jamais l'extension à tort.
-const looksLikeContinuedIdentification = (t) => isFuzzyText(t) || (FUZZY_WORK_TERM.test(t) && !!fuzzyGeoMatch(t));
+
+/**
+ * Nombre d'axes distincts (géo, format, rôle, langue parlée, genre, époque) détectés dans UN message
+ * isolé. Utilisé uniquement pour juger si un message COURT et SANS terme d'œuvre ("C'est une romance
+ * coréenne.") appartient quand même à une séquence d'identification déjà entamée : un message sans
+ * rapport n'a normalement aucune raison de recouper plusieurs de ces tables à la fois.
+ */
+function axisSignalCount(t) {
+  const negated = extractNegatedClues(t);
+  let n = 0;
+  if (fuzzyGeoMatch(t)) n++;
+  if (extractAxisMatches(t, FUZZY_FORMAT_TABLE, negated.format).length) n++;
+  if (extractAxisMatches(t, FUZZY_ROLE_TABLE, negated.role).length) n++;
+  if (extractAxisMatches(t, FUZZY_GENRE_TABLE, negated.genre).length) n++;
+  if (extractSpokenLanguage(t, negated.language).length) n++;
+  if (detectTimePeriod(t)) n++;
+  return n;
+}
+// Un message de suivi COURT (peu de mots) qui recoupe au moins un axe (genre/rôle/langue/geo/époque/
+// format) SANS reprendre le terme d'œuvre ni une formule d'identification explicite fait quand même
+// partie de la même séquence : ce sont exactement les messages produits en pratique pour enrichir un
+// contexte déjà entamé ("C'est une romance coréenne.", "Et je crois que ça date des années 2000.").
+// Volontairement borné en longueur pour rester spécifique : un message long et sans rapport a
+// beaucoup plus de chances de contenir par accident un mot d'une des tables.
+const isShortAxisFollowUp = (t) => {
+  const words = t.split(/\s+/).filter(Boolean).length;
+  return words > 0 && words <= 15 && axisSignalCount(t) >= 1;
+};
+// Gate côté message PRÉCÉDENT (contextHint/historyHint) : volontairement plus strict qu'côté message
+// courant, pour qu'un message sans rapport (contenant par hasard un prénom) ne déclenche jamais
+// l'extension à tort — mais doit malgré tout accepter les maillons intermédiaires courts et purement
+// axiaux de la chaîne (voir isShortAxisFollowUp ci-dessus), sans quoi la remontée de l'historique
+// s'arrête prématurément dès qu'un message de suivi ne répète pas "film/drama" (cas réel : un message
+// "C'est une romance coréenne." entre le message d'origine et un 3e message de suivi cassait la
+// remontée AVANT même d'atteindre le message d'origine, qui pourtant la remplit très largement).
+const looksLikeContinuedIdentification = (t) =>
+  isFuzzyText(t) || (FUZZY_WORK_TERM.test(t) && !!fuzzyGeoMatch(t)) || isShortAxisFollowUp(t);
 
 /**
  * Détecte une identification d'œuvre floue et en extrait les indices forts : noms/personnages,
@@ -1063,14 +1097,65 @@ function detectFuzzyIdentification(message, contextHint, historyHint) {
   };
 }
 
-/** Un résultat n'est "pertinent" que s'il recoupe les indices OBLIGATOIRES fournis (géo, noms propres),
- *  avec de vraies frontières de mot pour les noms : "Robin" ne doit jamais être considéré comme présent
- *  dans "Robinson" (voir nameBoundaryRx). */
+/**
+ * CORRECTION C : le FORMAT demandé (film/série/drama/anime/manga) doit être réellement vérifié, pas
+ * seulement "contenir le mot quelque part". Regarde le TITRE du résultat (signal fiable — une fiche
+ * ou un article nomme presque toujours son propre format dans son titre : "(TV Series)", "(2006 film)"…)
+ * pour un format EXPLICITEMENT différent de celui demandé. Un résultat identifié comme série dans son
+ * titre ne doit jamais devenir un candidat fort pour une recherche formulée comme "film" — et
+ * inversement — même s'il recoupe par ailleurs d'autres indices (géo, nom…).
+ * Volontairement silencieux si le format demandé n'est pas dans le titre ET qu'aucun AUTRE format n'y
+ * est mentionné non plus (rien à trancher) : ce n'est qu'un vrai conflit explicite qui exclut.
+ */
+function resultFormatConflicts(r, fuzzyCtx) {
+  if (!fuzzyCtx.format.length) return false;
+  const title = norm(r.title || '');
+  if (!title) return false;
+  const requestedLabels = new Set(fuzzyCtx.format.map((f) => f.label));
+  if (fuzzyCtx.format.some((f) => f.rx.test(title))) return false; // le titre confirme déjà le format demandé
+  return FUZZY_FORMAT_TABLE.some((f) => !requestedLabels.has(f.label) && f.rx.test(title));
+}
+
+/** Fenêtre de caractères autour d'une occurrence de nom, utilisée pour juger si ce nom y est présenté
+ *  comme un PERSONNAGE (voir nameIsCentral ci-dessous) plutôt que mentionné incidemment. */
+const FUZZY_CHARACTER_CONTEXT_WINDOW = 80;
+const FUZZY_CHARACTER_CONTEXT_RX = /\b(character|role|cast|plays?|played|portray(?:s|ed)?|stars?\s+as|acting\s+as|personnage|r[oô]les?|interpr[eè]te|incarn[eé]e?|joue(?:\s+le\s+r[oô]le)?)\b/i;
+
+/**
+ * CORRECTION D : un nom propre ne suffit pas s'il apparaît "n'importe où dans un long article sans
+ * rapport" — il faut une relation plus forte avec l'œuvre recherchée. Accepte trois signaux, chacun
+ * suffisant seul (heuristique locale légère, pas de NLP) :
+ *  - le nom figure dans le TITRE du résultat (fiche/article centré sur l'œuvre ou le personnage) ;
+ *  - le nom apparaît à proximité immédiate d'un terme indiquant personnage/rôle/cast ;
+ *  - la source est de type structuré "reference" (fiche d'œuvre — IMDb, MyDramaList, Wikipedia…) ou
+ *    "official"/"institutional", où un nom cité est nettement plus susceptible d'être un vrai
+ *    personnage de l'œuvre qu'une mention accidentelle.
+ * "Korean ... Robin ... article about something completely different" ne doit jamais suffire seul.
+ */
+function nameIsCentral(r, name) {
+  const title = norm(r.title || '');
+  if (nameBoundaryRx(name).test(title)) return true;
+  if (r.sourceType === 'reference' || r.sourceType === 'official' || r.sourceType === 'institutional') return true;
+  const txt = fuzzyResultText(r);
+  const rx = nameBoundaryRx(name);
+  const m = rx.exec(txt);
+  if (!m) return false;
+  const start = Math.max(0, m.index - FUZZY_CHARACTER_CONTEXT_WINDOW);
+  const end = Math.min(txt.length, m.index + name.length + FUZZY_CHARACTER_CONTEXT_WINDOW);
+  return FUZZY_CHARACTER_CONTEXT_RX.test(txt.slice(start, end));
+}
+
+/** Un résultat n'est "pertinent" que s'il recoupe les indices OBLIGATOIRES fournis (géo, noms propres,
+ *  format), avec de vraies frontières de mot pour les noms : "Robin" ne doit jamais être considéré
+ *  comme présent dans "Robinson" (voir nameBoundaryRx) — et un nom doit avoir un rôle central, pas
+ *  seulement apparaître au hasard dans un texte par ailleurs sans rapport (voir nameIsCentral,
+ *  CORRECTION D). Un conflit de format explicite (CORRECTION C) exclut aussi le résultat. */
 function resultMatchesClues(r, fuzzyCtx) {
   const txt = fuzzyResultText(r);
   if (txt.trim().length < 40) return false; // trop pauvre/générique pour confirmer quoi que ce soit
   if (fuzzyCtx.geoRx && !fuzzyCtx.geoRx.test(txt)) return false;
-  if (fuzzyCtx.names.length && !fuzzyCtx.names.some((n) => nameBoundaryRx(n).test(txt))) return false;
+  if (resultFormatConflicts(r, fuzzyCtx)) return false;
+  if (fuzzyCtx.names.length && !fuzzyCtx.names.some((n) => nameIsCentral(r, n))) return false;
   return true;
 }
 
@@ -1228,20 +1313,61 @@ function assessFuzzyResults(results, fuzzyCtx) {
   return { ok, onTopic: relevant.length, candidate: representative, unconfirmedExtras, extras };
 }
 
-/** Reformulation déterministe (sans dépendance payante) : indices connus + angle de recherche différent. */
+/**
+ * Reformulation déterministe (sans dépendance payante) : indices connus + angle de recherche
+ * VRAIMENT différent selon la tentative — pas un simple changement de suffixe.
+ *
+ * Constat de l'autopsie (TEST 1) : la requête générique du type "korean Robin boss English film
+ * 2000s movie title character cast" est souvent trop diluée pour faire remonter la bonne œuvre dans
+ * les premiers résultats Tavily — 4 des mots ("movie title character cast") n'apportent aucune
+ * discrimination, ils décrivent la CATÉGORIE de la recherche, pas l'œuvre cherchée.
+ *
+ * Deux correctifs, uniquement sur la FORME de la requête (jamais sur les indices eux-mêmes, tous
+ * dérivés de fuzzyCtx — jamais de titre/personnage en dur) :
+ *  1. Le suffixe générique n'est ajouté QUE si la requête reste pauvre en indices réels (moins de 2
+ *     axes discriminants hors nom, qui est déjà très spécifique à lui seul) : au-delà, il ne fait que
+ *     diluer une requête déjà bien ciblée.
+ *  2. Plusieurs ANGLES complémentaires (pas de quasi-doublons) : le premier met l'identité du
+ *     personnage en avant (nom + rôle + œuvre), pertinent pour une fiche de casting/personnage ; le
+ *     second recentre sur le contexte de production (pays + format + époque + langue + rôle),
+ *     pertinent pour une fiche d'œuvre générale ; un 3e réordonne encore pour rester distinct si les
+ *     deux premiers sont déjà épuisés. `attemptNo` (2, 3…) choisit l'angle de départ.
+ */
 function buildFuzzyVariant(fuzzyCtx, tried, attemptNo) {
-  const extraLabels = extraAxesFor(fuzzyCtx).map((e) => e.label);
+  const geo = fuzzyCtx.geoLabel;
+  const names = fuzzyCtx.names;
+  const formatLabels = fuzzyCtx.format.map((f) => f.label);
+  const roleLabels = fuzzyCtx.role.map((r) => r.label);
+  const languageLabels = fuzzyCtx.language.map((l) => l.label);
+  const genreLabels = fuzzyCtx.genre.map((g) => g.label);
   const timeLabel = fuzzyCtx.time ? fuzzyCtx.time.label : '';
-  const base = [fuzzyCtx.geoLabel, ...fuzzyCtx.names, ...extraLabels, timeLabel].filter(Boolean).join(' ').trim();
-  if (!base) return null;
-  // Suffixe générique volontairement neutre : il ne doit jamais réintroduire un terme qui pourrait
-  // correspondre à un label niable (ex. "drama"), sans quoi une correction explicite de l'utilisateur
-  // ("pas un drama") pourrait être contredite par ce simple gabarit de requête.
-  const suffix = attemptNo <= 2 ? 'movie title character cast' : 'cast character name identification';
-  const candidate = cleanText(`${base} ${suffix}`);
+
+  // Angle A : identité du personnage d'abord (nom + rôle), puis contexte de l'œuvre.
+  const angleCharacterFirst = [...names, ...roleLabels, geo, ...formatLabels, ...genreLabels, timeLabel];
+  // Angle B : contexte de production d'abord (pays + format + époque + langue + rôle), nom en dernier —
+  // volontairement une composition différente, pas juste le même ordre inversé mot à mot.
+  const angleWorkFirst = [geo, ...formatLabels, timeLabel, ...languageLabels, ...roleLabels, ...genreLabels, ...names];
+  // Angle C : repli si A et B sont déjà épuisés (ex. déjà essayés par le queryRewriter externe).
+  const angleAlt = [...formatLabels, geo, ...genreLabels, timeLabel, ...names, ...roleLabels, ...languageLabels];
+  const angles = [angleCharacterFirst, angleWorkFirst, angleAlt];
+
+  // Suffixe générique minimal, réservé aux cas pauvres en indices : au-delà de 2 axes discriminants
+  // réels (géo/format/rôle/langue/genre/époque — le nom compte déjà à part), il n'apporte plus rien.
+  // Suffixe volontairement neutre : il ne doit jamais réintroduire un terme qui pourrait correspondre
+  // à un label niable (ex. "drama"), sans quoi une correction explicite de l'utilisateur ("pas un
+  // drama") pourrait être contredite par ce simple gabarit de requête.
+  const discriminatingAxes = [geo, ...formatLabels, ...roleLabels, ...languageLabels, ...genreLabels, timeLabel].filter(Boolean).length;
+  const anchor = discriminatingAxes >= 2 ? '' : (names.length ? 'cast character' : 'movie title character cast');
+
   const seen = (q) => tried.some((t) => norm(t) === norm(q));
-  if (!candidate || seen(candidate)) return null;
-  return candidate;
+  const startAt = Math.max(0, Math.min(attemptNo - 2, angles.length - 1));
+  for (let i = startAt; i < angles.length; i++) {
+    const base = cleanText(angles[i].filter(Boolean).join(' '));
+    if (!base) continue;
+    const candidate = cleanText(anchor ? `${base} ${anchor}` : base);
+    if (candidate && !seen(candidate)) return candidate;
+  }
+  return null;
 }
 
 /** 3e requête de "vérification" d'un candidat : son titre extrait dynamiquement des résultats
@@ -1686,61 +1812,4 @@ async function searchWeb(message, options = {}) {
         retrieved, kept: finalKept.length, totalMs, searchedAt: now.toISOString(),
         partialFailure: errors.length > 0 && okRuns.length > 0, officialEndpointUsed: !!endpointData,
         fuzzy: fuzzyInfo
-          ? { triggered: true, attempts: fuzzyInfo.attempts, confirmed: fuzzyInfo.finalOk, onTopic: fuzzyInfo.onTopic, candidateTitle: fuzzyInfo.candidateTitle || null }
-          : { triggered: false },
-      },
-    };
-  } catch (e) {
-    // Filet de sécurité : rien ne doit faire tomber le moteur de chat.
-    log.error('search.unexpected', { message: String((e && e.message) || e) });
-    return baseResult({ triggered: true, error: { code: 'unexpected', message: redact(String((e && e.message) || e)) }, meta: { retrieved: 0, kept: 0, totalMs: Date.now() - started, searchedAt: null } });
-  }
-}
-
-// ───────────────────────────── 10. Compatibilité ────────────────────────────
-
-/**
- * Rendu texte brut (ancien style) pour un promptBuilder pas encore migré.
- * Le futur promptBuilder v2 utilisera directement result.results.
- */
-function formatResultsAsText(result) {
-  if (!result || !Array.isArray(result.results) || !result.results.length) return '';
-  return result.results.map((r) => {
-    const meta = [r.domain, r.publishedAt ? r.publishedAt.slice(0, 10) : 'date inconnue', r.sourceType].join(' · ');
-    return `[${r.id}] ${r.title} (${meta})\n${r.url}\n${r.content}`;
-  }).join('\n\n');
-}
-
-/**
- * Compatibilité avec l'ancien contrat : renvoie un bloc texte ou null, ne lève jamais.
- * (Le moteur utilise désormais searchWeb() directement.)
- */
-async function performWebSearch(query, options = {}) {
-  const result = await searchWeb(query, { ...options, skipIntentCheck: true });
-  return formatResultsAsText(result) || null;
-}
-
-module.exports = {
-  searchWeb,
-  performWebSearch,
-  needsWebSearch,
-  resolveWebIntent,
-  buildSearchPlan,
-  formatResultsAsText,
-  registerRule,
-  registerOfficialSource,
-  classifySource,
-  loadConfig,
-  isVagueQuery,
-  _internal: {
-    redact, normalizeUrl, degradePayload, buildPayload, processResults, INTENT_RULES, OFFICIAL_SOURCES,
-    detectFuzzyIdentification, assessFuzzyResults, buildFuzzyVariant, buildFuzzyVerification, annotateCorroboration,
-    extendFuzzyIdentification, FUZZY_MAX_TAVILY_CALLS, FUZZY_MAX_HISTORY, isRedundantQuery,
-    extractNegatedClues, extractAxisMatches, extractSpokenLanguage, pickActiveGeo, extraAxesFor,
-    FUZZY_GEO_TABLE, FUZZY_FORMAT_TABLE, FUZZY_ROLE_TABLE, FUZZY_LANGUAGE_TABLE, FUZZY_GENRE_TABLE,
-    buildFuzzyVerification, resultMatchesClues, confirmedExtras, nameBoundaryRx, detectTimePeriod,
-    clusterRelevantResults, scoreFuzzyResult,
-  },
-};
-
-
+          ? { triggered: true, attempts: fuzzyInfo.attempts, confirmed: fuzzyInfo.finalOk, onTopic: fuzzyInfo.onTopic, candidate
