@@ -850,8 +850,13 @@ test("Fuzzy B. indices dispersés sans rapport sémantique proche => confirmatio
   const fuzzyCtx = ws._internal.detectFuzzyIdentification(ROBIN_FULL, null);
   const filler = 'Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore. '.repeat(4);
   const dispersed = {
+    // "Robin" doit avoir un vrai rôle central (CORRECTION D : proximité d'un terme personnage/rôle/cast)
+    // pour être considéré comme relevant ; ce fixture teste ensuite que, MÊME relevant, un résultat où
+    // les indices sont dispersés aux deux extrémités d'un long texte perd face à un résultat cohésif
+    // (voir cluesAreClustered / scoreFuzzyResult) — Robin en tant que "mentioned briefly" sans contexte
+    // de personnage ne doit, lui, plus jamais être considéré relevant du tout (voir Fuzzy C/D/Correction D).
     title: 'General Entertainment Roundup', url: 'https://blogexample.net/roundup', domain: 'blogexample.net', sourceType: 'other',
-    content: `Robin is mentioned briefly here. ${filler} Meanwhile, elsewhere in Korean media, an English-speaking boss discussed a movie unrelated to this piece.`,
+    content: `Robin appears as a character in this piece. ${filler} Meanwhile, elsewhere in Korean media, an English-speaking boss discussed a movie unrelated to this piece.`,
   };
   const cohesive = {
     title: 'Some Korean Movie - Cast', url: 'https://blogexample2.net/cast', domain: 'blogexample2.net', sourceType: 'other',
@@ -1002,4 +1007,199 @@ test("Fuzzy M. aucun titre/personnage n'est câblé en dur : la sélection de ca
   };
   const verdict = ws._internal.assessFuzzyResults([decoy, good], ctx);
   assert.equal(verdict.candidate, good, "le vrai candidat l'emporte grâce aux indices, jamais à un nom câblé en dur");
+});
+
+// ─────────────── Partie 4 : corrections production (relevant≠candidate durci, format, centralité, multi-tour) ───────────────
+
+const ROBIN_MSG1 = "Un film coréen, le personnage masculin principal s'appelle Robin, il est le patron de l'héroïne et il parle souvent anglais. Je crois que c'est un film des années 2000, je ne me souviens plus du titre…";
+const ROBIN_MSG2 = "C'est une romance coréenne.";
+const ROBIN_MSG3 = "Et je crois que ça date des années 2000.";
+
+test('CORRECTION C. resultFormatConflicts : une fiche "(TV Series)" est en conflit avec une demande "film", pas avec une demande "série"', () => {
+  const ctxFilm = ws._internal.detectFuzzyIdentification(ROBIN_MSG1, null);
+  const series = { title: 'Hong Gil-dong (TV Series) - Wikipedia', content: 'A Korean TV series about a legendary hero.' };
+  assert.equal(ws._internal.resultFormatConflicts(series, ctxFilm), true, 'une série ne doit jamais satisfaire une demande de film');
+  const ctxSeries = ws._internal.detectFuzzyIdentification('Il y a une série coréenne où Robin est le patron du personnage féminin.', null);
+  assert.equal(ws._internal.resultFormatConflicts(series, ctxSeries), false, 'la même fiche satisfait bien une demande de série');
+  const noFormatInTitle = { title: 'Some Roundup Article', content: 'discusses several works' };
+  assert.equal(ws._internal.resultFormatConflicts(noFormatInTitle, ctxFilm), false, 'un titre sans format explicite ne déclenche jamais de conflit');
+});
+
+test('CORRECTION D. nameIsCentral : un nom cité en passant dans un article sans rapport ne suffit jamais seul', () => {
+  const r1 = { title: 'The Greatest Archery Movies: Ever - Bow International', sourceType: 'other', content: 'A listicle of archery movies. One entry, Robin Hood, is briefly noted among many others with no further discussion.' };
+  assert.equal(ws._internal.nameIsCentral(r1, 'Robin'), false, 'une simple occurrence perdue dans un long article générique ne doit pas suffire');
+  const r2 = { title: 'Some Show - Cast', sourceType: 'other', content: 'Robin plays the boss character opposite the female lead.' };
+  assert.equal(ws._internal.nameIsCentral(r2, 'Robin'), true, 'un nom à proximité immédiate d\'un terme de personnage/rôle est central');
+  const r3 = { title: 'Untitled article', sourceType: 'reference', content: 'Robin appears in this reference entry about the show, among other details.' };
+  assert.equal(ws._internal.nameIsCentral(r3, 'Robin'), true, 'une source structurée de type fiche d\'œuvre (reference) confirme le nom sans heuristique supplémentaire');
+  const r4 = { title: 'Robin Heiden (2006) - Full Cast', sourceType: 'other', content: 'nothing else relevant here at all' };
+  assert.equal(ws._internal.nameIsCentral(r4, 'Robin'), true, 'un nom présent dans le titre lui-même est toujours central');
+});
+
+test('CORRECTION I. intégration multi-tour réelle (3 messages) : contexte cumulé, cap à 3 appels, aucun mauvais candidat', async () => {
+  // Tour 1 : uniquement un résultat "riche en mots-clés" mais hors-sujet (reproduit le cas réel du
+  // rapport) → aucun candidat ne doit être confirmé, malgré le recouvrement lexical.
+  let n1 = 0;
+  const fetch1 = async () => {
+    n1++;
+    return mkRes(200, okBody([
+      { title: 'The Greatest Archery Movies: Ever - Bow International', url: 'https://example.org/archery', domain: 'example.org', content: 'A generic listicle of archery movies including some Korean cinema history. One entry, titled Robin Hood, is listed briefly among dozens of unrelated films with no further discussion of any boss or workplace at all.', score: 0.4 },
+    ]));
+  };
+  const { o: o1 } = opts(fetch1, { skipIntentCheck: true });
+  const r1 = await ws.searchWeb(ROBIN_MSG1, o1);
+  assert.ok(n1 <= 3, 'plafond de 3 requêtes Tavily respecté au tour 1');
+  assert.equal(r1.meta.fuzzy.confirmed, false, 'tour 1 : rien de solide, donc pas de confirmation');
+  assert.doesNotMatch(r1.meta.fuzzy.candidateTitle || '', /archery/i, 'le mauvais résultat riche en mots-clés ne devient jamais candidat');
+
+  // Tour 2 : "C'est une romance coréenne." → le contexte fusionne avec le message 1 (nom, rôle, format,
+  // langue) ET le nouvel indice de genre.
+  const ctx2 = ws._internal.detectFuzzyIdentification(ROBIN_MSG2, null, [ROBIN_MSG1]);
+  assert.ok(ctx2, 'le contexte fuzzy est bien conservé au 2e message');
+  assert.ok(ctx2.genre.some((g) => g.label === 'romance'), '"romance" est bien ajouté');
+  assert.ok(ctx2.names.some((n) => n.toLowerCase() === 'robin'), 'les indices du message 1 restent fusionnés');
+  let n2 = 0;
+  const fetch2 = async () => {
+    n2++;
+    return mkRes(200, okBody([
+      { title: 'Hong Gil-dong (TV Series) - Wikipedia', url: 'https://en.wikipedia.org/wiki/Hong_Gil-dong', domain: 'en.wikipedia.org', sourceType: 'reference', content: 'A Korean TV series (not a film) about a legendary hero. English subtitles translated by Robin Thompson for the international release.', score: 0.5 },
+    ]));
+  };
+  const { o: o2 } = opts(fetch2, { skipIntentCheck: true, historyHint: [ROBIN_MSG1] });
+  const r2 = await ws.searchWeb(ROBIN_MSG2, o2);
+  assert.doesNotMatch(r2.meta.fuzzy.candidateTitle || '', /hong gil-dong/i, 'une série ne doit jamais devenir candidat pour une recherche de film (CORRECTION C)');
+
+  // Tour 3 : "Et je crois que ça date des années 2000." → suivi purement temporel, doit hériter de
+  // TOUT le contexte précédent (nom, rôle, format, langue, genre) et enrichir l'axe temporel.
+  const ctx3 = ws._internal.detectFuzzyIdentification(ROBIN_MSG3, null, [ROBIN_MSG1, ROBIN_MSG2]);
+  assert.ok(ctx3, 'le contexte fuzzy est bien conservé au 3e message (avant la correction : cassé, fuzzyAttempts restait à 0)');
+  assert.ok(ctx3.time && ctx3.time.min === 2000 && ctx3.time.max === 2009, '"2000-2009" est bien ajouté/conservé');
+  assert.ok(ctx3.genre.some((g) => g.label === 'romance'), '"romance" ajouté au message 2 reste présent au message 3');
+  assert.ok(ctx3.role.some((rr) => rr.label === 'boss'), 'les indices du message 1 (rôle) restent fusionnés');
+  assert.ok(ctx3.names.some((n) => n.toLowerCase() === 'robin'), 'les indices du message 1 (nom) restent fusionnés');
+
+  let n3 = 0;
+  const fetch3 = async () => {
+    n3++;
+    return mkRes(200, okBody([
+      { title: 'Unrelated generic result', url: `https://example.org/unrelated${n3}`, domain: 'example.org', content: 'Nothing useful here, generic content unrelated to the search at all.', score: 0.2 },
+    ]));
+  };
+  const { o: o3 } = opts(fetch3, { skipIntentCheck: true, historyHint: [ROBIN_MSG1, ROBIN_MSG2] });
+  const r3 = await ws.searchWeb(ROBIN_MSG3, o3);
+  assert.ok(n3 >= 2, 'le 3e message déclenche bien une extension fuzzy réelle (avant la correction : fuzzyAttempts restait à 0)');
+  assert.ok(n3 <= 3, 'plafond de 3 requêtes Tavily respecté au tour 3');
+  assert.equal(r3.meta.fuzzy.triggered, true);
+});
+
+test("CORRECTION J. résultats riches en mots-clés dispersés hors-sujet → aucun candidat confirmé (candidate === null ou non confirmé)", () => {
+  const ctx = ws._internal.detectFuzzyIdentification(ROBIN_MSG1, null);
+  const offTopicButKeywordRich = {
+    title: 'Understanding Korean Cinema Trends in the 2000s',
+    url: 'https://example.org/trends', domain: 'example.org', sourceType: 'other',
+    content: 'This film studies article discusses Korean cinema broadly across the 2000s. It briefly footnotes a critic named Robin Ellison and mentions a studio boss in an unrelated anecdote about English-language distribution deals, with no connection whatsoever to any specific character or plot.',
+  };
+  const verdict = ws._internal.assessFuzzyResults([offTopicButKeywordRich], ctx);
+  assert.equal(verdict.candidate, null, "un résultat hors-sujet, même riche en mots-clés dispersés, ne doit jamais devenir candidat");
+  assert.equal(verdict.ok, false);
+});
+
+// ─────────────── Partie 5 : buildFuzzyVariant — rappel de la 1re requête (pas de titre/perso en dur) ───────────────
+
+test('CORRECTION Q1. un message riche en indices produit une 1re requête discriminante (peu/pas de remplissage générique)', () => {
+  const ctx = ws._internal.detectFuzzyIdentification(ROBIN_MSG1, null);
+  const q = ws._internal.buildFuzzyVariant(ctx, [ROBIN_MSG1], 2);
+  assert.ok(q, 'une requête est bien générée');
+  // Les indices réellement détectés doivent tous être présents quelque part dans la requête.
+  const nq = q.toLowerCase();
+  assert.match(nq, /korean/);
+  assert.match(nq, /film/);
+  assert.match(nq, /\bboss\b/);
+  assert.match(nq, /robin/i);
+  assert.match(nq, /2000s/);
+});
+
+test("CORRECTION Q2. les termes purement génériques (\"movie title character cast\") ne prennent pas toute la place quand la requête est déjà bien spécifiée", () => {
+  const ctx = ws._internal.detectFuzzyIdentification(ROBIN_MSG1, null);
+  const q = ws._internal.buildFuzzyVariant(ctx, [ROBIN_MSG1], 2);
+  const genericWords = ['movie', 'title', 'character', 'cast', 'identification'];
+  const qWords = q.toLowerCase().split(/\s+/);
+  const genericCount = qWords.filter((w) => genericWords.includes(w)).length;
+  assert.ok(genericCount <= 1, `la requête ne doit plus être dominée par du remplissage générique (obtenu: "${q}")`);
+  assert.ok(qWords.length <= 6, `requête compacte attendue pour un contexte déjà riche (obtenu: "${q}", ${qWords.length} mots)`);
+});
+
+test('CORRECTION Q3. tous les indices réellement détectés (y compris épars) restent exploités entre les tentatives 2 et 3', () => {
+  const ctx = ws._internal.detectFuzzyIdentification(ROBIN_MSG1, null);
+  const q2 = ws._internal.buildFuzzyVariant(ctx, [ROBIN_MSG1], 2);
+  const q3 = ws._internal.buildFuzzyVariant(ctx, [ROBIN_MSG1, q2], 3);
+  assert.ok(q3, 'une 2e reformulation reste disponible');
+  // "English" (langue parlée) n'est volontairement pas dans l'angle "personnage d'abord" (tentative 2)
+  // mais doit apparaître dans l'angle "contexte de production" (tentative 3) : rien n'est perdu, juste
+  // réparti différemment selon l'angle.
+  assert.doesNotMatch(q2.toLowerCase(), /english/, 'tentative 2 : angle "personnage d\'abord", sans la langue parlée');
+  assert.match(q3.toLowerCase(), /english/, 'tentative 3 : angle "contexte de production", inclut la langue parlée');
+});
+
+test("CORRECTION Q4. aucun titre/personnage du cas réel (\"Seducing Mr. Perfect\", \"Robin Heiden\") n'est jamais câblé en dur dans buildFuzzyVariant", () => {
+  const ctx = ws._internal.detectFuzzyIdentification(ROBIN_MSG1, null);
+  const q2 = ws._internal.buildFuzzyVariant(ctx, [ROBIN_MSG1], 2);
+  const q3 = ws._internal.buildFuzzyVariant(ctx, [ROBIN_MSG1, q2], 3);
+  for (const q of [q2, q3]) {
+    assert.doesNotMatch(q.toLowerCase(), /seducing|perfect|heiden/, 'aucun titre/nom de famille du cas réel ne doit fuiter dans la requête générée');
+  }
+  assert.doesNotMatch(ws.formatResultsAsText.toString() + ws._internal.buildFuzzyVariant.toString(), /seducing|perfect|heiden/i, "buildFuzzyVariant lui-même ne doit contenir aucune de ces chaînes en dur");
+});
+
+test("CORRECTION Q5. un cas totalement différent (anime japonais, indices distincts) produit une requête adaptée à CES indices, sans reprendre le vocabulaire du cas Robin", () => {
+  const msg = "Il y a un anime japonais où Zorbaxel est l'ami du héros, il parlait japonais, ça devait sortir dans les années 2010, impossible de retrouver le titre.";
+  const ctx = ws._internal.detectFuzzyIdentification(msg, null);
+  const q = ws._internal.buildFuzzyVariant(ctx, [msg], 2);
+  const nq = q.toLowerCase();
+  assert.match(nq, /japanese/);
+  assert.match(nq, /anime/);
+  assert.match(nq, /zorbaxel/i);
+  assert.match(nq, /friend/);
+  assert.match(nq, /2010s/);
+  assert.doesNotMatch(nq, /korean|\brobin\b|\bboss\b/, "aucun terme du cas Robin ne doit apparaître pour un cas totalement différent");
+});
+
+test('CORRECTION Q6. les requêtes générées à des tentatives successives restent réellement différentes (pas de quasi-doublon)', () => {
+  const ctx = ws._internal.detectFuzzyIdentification(ROBIN_MSG1, null);
+  const q2 = ws._internal.buildFuzzyVariant(ctx, [ROBIN_MSG1], 2);
+  const q3 = ws._internal.buildFuzzyVariant(ctx, [ROBIN_MSG1, q2], 3);
+  assert.notEqual(q2.toLowerCase(), q3.toLowerCase());
+  // Pas un simple réordonnancement du même sac de mots : l'angle change réellement d'emphase (le
+  // premier terme de chaque requête reflète un axe différent), et au moins un mot est propre à l'une
+  // des deux formulations (voir CORRECTION Q3 : "English" n'apparaît que dans l'angle "contexte de
+  // production").
+  assert.notEqual(q2.toLowerCase().split(/\s+/)[0], q3.toLowerCase().split(/\s+/)[0], 'le mot en tête de requête doit changer d\'un angle à l\'autre');
+  const w2 = new Set(q2.toLowerCase().split(/\s+/));
+  const w3 = new Set(q3.toLowerCase().split(/\s+/));
+  const onlyIn3 = [...w3].some((w) => !w2.has(w));
+  assert.ok(onlyIn3, 'la 2e formulation doit apporter au moins un terme absent de la première');
+});
+
+test('CORRECTION Q7. le plafond de 3 appels Tavily au total reste respecté avec la nouvelle construction de requête', async () => {
+  let queries = [];
+  const fetchImpl = async (u, init) => {
+    queries.push(JSON.parse(init.body).query);
+    return mkRes(200, okBody([
+      { title: 'Toujours sans rapport', url: `https://example.org/x${queries.length}`, content: 'Contenu générique totalement sans rapport avec les indices demandés, assez long pour passer le filtre de longueur minimal.', score: 0.1 },
+    ]));
+  };
+  const { o } = opts(fetchImpl, { skipIntentCheck: true });
+  const r = await ws.searchWeb(ROBIN_MSG1, o);
+  assert.ok(queries.length <= 3, `au plus 3 requêtes Tavily, obtenu ${queries.length}`);
+  assert.equal(new Set(queries.map((q) => q.toLowerCase())).size, queries.length, 'les requêtes envoyées sont toutes distinctes (pas de doublon gaspillant le budget)');
+  assert.equal(r.meta.fuzzy.triggered, true);
+});
+
+test('CORRECTION Q8. cas pauvre en indices : un ancrage minimal reste ajouté (filet de sécurité), sans jamais dépasser la phrase générique historique', () => {
+  const msg = "Il y a un vieux film coréen où le personnage s'appelle Quixolt, je ne me souviens de rien d'autre.";
+  const ctx = ws._internal.detectFuzzyIdentification(msg, null);
+  const q = ws._internal.buildFuzzyVariant(ctx, [msg], 2);
+  assert.ok(q);
+  assert.match(q.toLowerCase(), /quixolt/i);
+  assert.match(q.toLowerCase(), /korean/);
 });
