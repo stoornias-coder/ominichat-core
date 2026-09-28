@@ -1,0 +1,187 @@
+--- a/core/search/webSearch.js	2026-09-28 06:20:17.604495951 +0000
++++ b/core/search/webSearch.js	2026-09-28 06:20:47.576805766 +0000
+@@ -1135,9 +1135,13 @@
+ function nameIsCentral(r, name) {
+   const title = norm(r.title || '');
+   if (nameBoundaryRx(name).test(title)) return true;
+-  if (r.sourceType === 'reference' || r.sourceType === 'official' || r.sourceType === 'institutional') return true;
+   const txt = fuzzyResultText(r);
+   const rx = nameBoundaryRx(name);
++  // Source structurée (fiche d'œuvre, site officiel/institutionnel) : le nom est jugé central sans
++  // exiger de contexte de personnage — MAIS seulement s'il figure réellement dans le texte du résultat.
++  // Sans cette condition, une page de référence sans aucun rapport avec le nom (ex. fiche d'un film qui
++  // ne mentionne jamais "Robin") passait pour une correspondance centrale du seul fait de sa catégorie.
++  if ((r.sourceType === 'reference' || r.sourceType === 'official' || r.sourceType === 'institutional') && rx.test(txt)) return true;
+   const m = rx.exec(txt);
+   if (!m) return false;
+   const start = Math.max(0, m.index - FUZZY_CHARACTER_CONTEXT_WINDOW);
+@@ -1284,19 +1288,29 @@
+ 
+   let winner = null;
+   for (const c of clusters) {
+-    const evals = c.items.map((r) => ({ r, ...scoreFuzzyResult(r, fuzzyCtx, extras) }));
++    let evals = c.items.map((r) => ({ r, ...scoreFuzzyResult(r, fuzzyCtx, extras) }));
++    // Période explicitement donnée par l'utilisateur ("années 2000", "en 2006") : un résultat dont l'année
++    // la contredit (fuzzyYearConsistency === -1) ne peut ni devenir candidat, ni contribuer à confirmer
++    // un indice, ni compter comme source de corroboration. Il reste "pertinent" (onTopic) mais n'ancre
++    // plus la requête de vérification. Sans période explicite (fuzzyCtx.time === null) : comportement inchangé.
++    if (fuzzyCtx.time) evals = evals.filter((e) => fuzzyYearConsistency(e.r, fuzzyCtx.time) !== -1);
++    if (!evals.length) continue;
+     const confirmedLabels = new Set();
+     for (const e of evals) for (const cf of e.confirmed) confirmedLabels.add(cf.label);
+     const best = evals.reduce((a, b) => (b.score >= a.score ? b : a));
+-    const independentDomains = c.domains.size;
++    const independentDomains = new Set(evals.map((e) => e.r.domain)).size;
+     // Plusieurs sources cohérentes (domaines distincts) sur la même œuvre corroborent réellement le
+     // cluster ; une source isolée, même contenant tous les mots-clés, n'obtient jamais ce bonus.
+     const corroborationBonus = independentDomains > 1 ? 2 : 0;
+-    const soleWeakSource = c.items.length === 1 && independentDomains === 1 && fuzzySourceReliability(best.r) === 0;
++    const soleWeakSource = evals.length === 1 && independentDomains === 1 && fuzzySourceReliability(best.r) === 0;
+     const candidate = { representative: best.r, confirmedLabels, soleWeakSource, score: best.score + corroborationBonus };
+     if (!winner || candidate.score > winner.score) winner = candidate;
+   }
+ 
++  // Tous les clusters écartés par la période explicite : aucun candidat (la requête de vérification
++  // n'est alors pas construite et l'extension retombe sur ses reformulations par indices).
++  if (!winner) return { ok: false, onTopic: relevant.length, candidate: null, unconfirmedExtras: extras, extras };
++
+   const { representative, confirmedLabels, soleWeakSource } = winner;
+   const isCandidate = extras.length === 0 || confirmedLabels.size > 0;
+   if (!isCandidate) return { ok: false, onTopic: relevant.length, candidate: null, unconfirmedExtras: extras, extras };
+@@ -1864,7 +1878,7 @@
+     extendFuzzyIdentification, FUZZY_MAX_TAVILY_CALLS, FUZZY_MAX_HISTORY, isRedundantQuery,
+     extractNegatedClues, extractAxisMatches, extractSpokenLanguage, pickActiveGeo, extraAxesFor,
+     FUZZY_GEO_TABLE, FUZZY_FORMAT_TABLE, FUZZY_ROLE_TABLE, FUZZY_LANGUAGE_TABLE, FUZZY_GENRE_TABLE,
+-    buildFuzzyVerification, resultMatchesClues, confirmedExtras, nameBoundaryRx, detectTimePeriod,
++    buildFuzzyVerification, resultMatchesClues, confirmedExtras, nameBoundaryRx, detectTimePeriod, nameIsCentral,
+     clusterRelevantResults, scoreFuzzyResult,
+   },
+ };
+--- a/core/search/webSearch.test.js	2026-09-28 06:20:17.605114372 +0000
++++ b/core/search/webSearch.test.js	2026-09-28 06:32:06.584469971 +0000
+@@ -1203,3 +1203,125 @@
+   assert.match(q.toLowerCase(), /quixolt/i);
+   assert.match(q.toLowerCase(), /korean/);
+ });
++
++// ─────────────── CORRECTIONS "Robin / Boss (2025)" : source de référence sans le nom, candidat hors période ───────────────
++// Les titres/pages ci-dessous sont des FIXTURES de test (fictives), pas des données réelles.
++
++const ROBIN_MSG = "Un film coréen, le personnage masculin principal s'appelle Robin, il est le patron de l'héroïne et il parle souvent anglais. Je crois que c'est un film des années 2000, je ne me souviens plus du titre…";
++
++const mkFuzzyResult = (over) => ({
++  title: 'x', url: 'https://en.wikipedia.org/wiki/x', domain: 'en.wikipedia.org', content: '', rawContent: '',
++  sourceType: 'reference', score: 0.5, ...over,
++});
++// Fiche "reference" d'un film de 2025 qui parle d'un boss mais ne mentionne JAMAIS Robin.
++const BOSS_2025_NO_ROBIN = mkFuzzyResult({
++  title: 'Quixboss (2025 film)',
++  content: 'Quixboss is a 2025 South Korean action comedy film about gangsters. The boss of the organization is arrested and the crew must ...',
++});
++// Même fiche, mais qui cite Robin (isole la règle de période de la règle sur le nom).
++const BOSS_2025_WITH_ROBIN = mkFuzzyResult({
++  title: 'Quixboss (2025 film)',
++  content: 'Quixboss is a 2025 South Korean film. Robin is the new boss of the heroine and often speaks English in the office.',
++});
++// Fiche compatible avec tous les indices : coréen, film, Robin patron, anglais, 2006.
++const COMPATIBLE_2006 = mkFuzzyResult({
++  title: 'Zelvanto Story (2006 film)', url: 'https://en.wikipedia.org/wiki/Zelvanto_Story', domain: 'en.wikipedia.org',
++  content: 'Zelvanto Story is a 2006 South Korean romantic comedy film. Robin, the new boss of the heroine, speaks mostly English at the office.',
++});
++
++test('CORRECTION Robin A. nameIsCentral : une source "reference" SANS le nom n\'est plus centrale du seul fait de son type', () => {
++  const { nameIsCentral } = ws._internal;
++  assert.equal(nameIsCentral(BOSS_2025_NO_ROBIN, 'Robin'), false, 'fiche Wikipedia sans "Robin" : pas une correspondance centrale');
++  assert.equal(nameIsCentral({ ...BOSS_2025_NO_ROBIN, sourceType: 'official' }, 'Robin'), false, 'même raccourci pour official');
++  assert.equal(nameIsCentral({ ...BOSS_2025_NO_ROBIN, sourceType: 'institutional' }, 'Robin'), false, 'même raccourci pour institutional');
++  // Le raccourci reste valable quand le nom figure réellement dans la fiche (comportement inchangé).
++  assert.equal(nameIsCentral(BOSS_2025_WITH_ROBIN, 'Robin'), true);
++  assert.equal(nameIsCentral(mkFuzzyResult({ title: 'Untitled article', content: 'Robin appears in this reference entry about the show, among other details.' }), 'Robin'), true);
++  // Frontière de mot : "Robinson" n'est pas "Robin".
++  assert.equal(nameIsCentral(mkFuzzyResult({ title: 'Some film', content: 'The producer Robinson reviewed the script for this film.' }), 'Robin'), false);
++});
++
++test('CORRECTION Robin A bis. resultMatchesClues : la fiche sans "Robin" ne recoupe plus les indices obligatoires', () => {
++  const f = ws._internal.detectFuzzyIdentification(ROBIN_MSG);
++  assert.deepEqual(f.names, ['Robin']);
++  assert.equal(ws._internal.resultMatchesClues(BOSS_2025_NO_ROBIN, f), false);
++  assert.equal(ws._internal.resultMatchesClues(BOSS_2025_WITH_ROBIN, f), true, 'avec le nom, la fiche reste pertinente (c\'est la période qui l\'écartera comme candidat)');
++});
++
++test('CORRECTION Robin B. assessFuzzyResults : un film de 2025 contredisant "années 2000" ne devient jamais candidat', () => {
++  const f = ws._internal.detectFuzzyIdentification(ROBIN_MSG);
++  assert.deepEqual(f.time && [f.time.min, f.time.max], [2000, 2009]);
++  const v = ws._internal.assessFuzzyResults([BOSS_2025_WITH_ROBIN], f);
++  assert.equal(v.candidate, null, 'le film de 2025 est pertinent mais hors période : aucun candidat');
++  assert.equal(v.ok, false);
++  assert.equal(v.onTopic, 1, 'il reste compté comme pertinent (onTopic), il n\'ancre simplement plus la vérification');
++  // Sans candidat, aucune requête de vérification bâtie sur son titre.
++  assert.equal(ws._internal.buildFuzzyVerification(f, v, [ROBIN_MSG]), null);
++  // Non-régression : SANS période explicite dans le message, le même résultat reste un candidat possible.
++  const msgNoPeriod = "Un film coréen, le personnage masculin principal s'appelle Robin, il est le patron de l'héroïne et il parle souvent anglais. Je ne me souviens plus du titre…";
++  const fNoTime = ws._internal.detectFuzzyIdentification(msgNoPeriod);
++  assert.equal(fNoTime.time, null);
++  assert.equal(ws._internal.assessFuzzyResults([BOSS_2025_WITH_ROBIN], fNoTime).candidate.title, 'Quixboss (2025 film)');
++});
++
++test('CORRECTION Robin C. un candidat compatible avec les indices est toujours sélectionné, même en présence d\'un film hors période', () => {
++  const f = ws._internal.detectFuzzyIdentification(ROBIN_MSG);
++  const alone = ws._internal.assessFuzzyResults([COMPATIBLE_2006], f);
++  assert.equal(alone.candidate.title, 'Zelvanto Story (2006 film)');
++  assert.equal(alone.ok, true, 'tous les indices confirmés par la fiche compatible');
++  // Mélangé à un film de 2025 pertinent mais hors période (lui arrivant en premier) : c'est le compatible qui gagne.
++  const mixed = ws._internal.assessFuzzyResults([BOSS_2025_WITH_ROBIN, COMPATIBLE_2006], f);
++  assert.equal(mixed.candidate.title, 'Zelvanto Story (2006 film)');
++  assert.equal(mixed.ok, true);
++  // Une fiche sans année mentionnée n'est jamais pénalisée par la règle de période.
++  const noYear = mkFuzzyResult({ title: 'Kelmora (film)', content: 'Kelmora is a South Korean romantic comedy film. Robin, the boss of the heroine, speaks English.' });
++  assert.equal(ws._internal.assessFuzzyResults([noYear], f).candidate.title, 'Kelmora (film)');
++});
++
++test('CORRECTION Robin E. bout en bout (Tavily simulé) : la phrase de Robin ne produit plus de requête ancrée sur le film de 2025', async () => {
++  const sent = [];
++  const fetchImpl = async (url, init) => {
++    const body = JSON.parse(init.body);
++    sent.push(body.query);
++    const q = body.query.toLowerCase();
++    // Tout ce qui parle de "boss" ramène la fiche 2025 (sans Robin) ; la requête centrée "époque + langue" ramène la fiche compatible.
++    const results = /english/.test(q) && /2000s/.test(q) && /(?:^|\s)korean film 2000s english/.test(q)
++      ? [{ title: COMPATIBLE_2006.title, url: COMPATIBLE_2006.url, content: COMPATIBLE_2006.content, score: 0.8 }]
++      : [{ title: BOSS_2025_NO_ROBIN.title, url: 'https://en.wikipedia.org/wiki/Quixboss_(2025_film)', content: BOSS_2025_NO_ROBIN.content, score: 0.9 }];
++    return mkRes(200, okBody(results));
++  };
++  const { o } = opts(fetchImpl, { skipIntentCheck: true });
++  const r = await ws.searchWeb(ROBIN_MSG, o);
++  assert.equal(r.triggered, true);
++  assert.ok(sent.length >= 1 && sent.length <= 3, 'plafond de 3 requêtes inchangé');
++  assert.ok(!sent.some((q) => /quixboss/i.test(q)), 'aucune requête ne reprend le titre du film de 2025 : ' + JSON.stringify(sent));
++  assert.notEqual(r.meta.fuzzy.candidateTitle, 'Quixboss (2025 film)');
++});
++
++test('CORRECTION Robin D. la recherche web normale (question précise, non floue) reste fonctionnelle', async () => {
++  const calls = [];
++  const fetchImpl = async (url, init) => {
++    calls.push(JSON.parse(init.body));
++    return mkRes(200, okBody([
++      { title: 'Supported Models - GroqCloud', url: 'https://console.groq.com/docs/models', content: 'Groq models available: llama, gpt-oss', score: 0.7, published_date: 'Mon, 21 Sep 2026 08:00:00 GMT' },
++      { title: 'Le Monde', url: 'https://www.lemonde.fr/tech/groq', content: 'Groq lève des fonds pour ses puces', score: 0.5 },
++    ]));
++  };
++  const { o } = opts(fetchImpl);
++  const r = await ws.searchWeb('Quels sont les modèles Groq disponibles ?', o);
++  assert.equal(r.ok, true);
++  assert.equal(r.triggered, true);
++  assert.equal(calls.length, 1, 'une seule requête Tavily : le pipeline flou ne s\'active pas');
++  assert.ok(r.results.length >= 1);
++  assert.equal(r.meta.fuzzy.triggered, false);
++});
++
++test('CORRECTION Robin D bis. sans période explicite ET sans année dans la fiche : le candidat reste sélectionnable (aucune règle de période)', () => {
++  const msgNoPeriod = "Un film coréen, le personnage masculin principal s'appelle Robin, il est le patron de l'héroïne et il parle souvent anglais. Je ne me souviens plus du titre…";
++  const f = ws._internal.detectFuzzyIdentification(msgNoPeriod);
++  assert.equal(f.time, null, 'aucune période extraite du message');
++  const noYear = mkFuzzyResult({ title: 'Kelmora (film)', content: 'Kelmora is a South Korean romantic comedy film. Robin, the boss of the heroine, speaks English.' });
++  assert.equal(ws._internal.assessFuzzyResults([noYear], f).candidate.title, 'Kelmora (film)');
++  // Un film récent n'est pas non plus écarté quand rien n'a été demandé côté époque.
++  assert.equal(ws._internal.assessFuzzyResults([BOSS_2025_WITH_ROBIN], f).candidate.title, 'Quixboss (2025 film)');
++});
