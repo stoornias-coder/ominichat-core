@@ -1,0 +1,206 @@
+--- a/core/search/webSearch.js
++++ b/core/search/webSearch.js
+@@ -654,8 +654,19 @@
+   Number(!!b.preferred) - Number(!!a.preferred) ||
+   (b.score ?? 0) - (a.score ?? 0);
+ 
+-/** Fusionne, dédoublonne, filtre, classe. Retourne { kept, rejected }. */
+-function processResults(perQuery, plan, cfg) {
++/**
++ * Fusionne, dédoublonne, filtre, classe. Retourne { kept, rejected }.
++ * `opts` (optionnel, uniquement pour l'identification floue — voir searchWeb) :
++ *   pinned         résultat candidat CONFIRMÉ (assessFuzzyResults().ok === true, sinon null) : jamais perdu par la fusion
++ *                  d'URL, le dédoublonnage de titre, le filtre de score/pertinence lexicale, domain_cap ou
++ *                  over_limit (seul `suspicious_content` le rejette encore), et placé en tête ;
++ *   isIncompatible (r) => boolean : les résultats explicitement incompatibles (année/pays) sont relégués
++ *                  après les autres (jamais supprimés : fail-open conservé).
++ * Sans `opts`, le comportement est strictement celui d'avant.
++ */
++function processResults(perQuery, plan, cfg, opts = {}) {
++  const pinned = (opts && opts.pinned) || null;
++  const isIncompatible = opts && typeof opts.isIncompatible === 'function' ? opts.isIncompatible : null;
+   const rejected = [];
+   const rej = (r, reason) => rejected.push({ domain: r.domain, title: truncate(r.title, 80, false), reason });
+ 
+@@ -667,7 +678,8 @@
+       const prev = byUrl.get(key);
+       if (!prev) { byUrl.set(key, r); continue; }
+       prev.queryIds = [...new Set([...prev.queryIds, ...r.queryIds])];
+-      if ((r.score ?? 0) > (prev.score ?? 0)) { r.queryIds = prev.queryIds; byUrl.set(key, r); rej(prev, 'duplicate_url'); } else rej(r, 'duplicate_url');
++      // Le candidat épinglé l'emporte toujours : c'est SON extrait qui a confirmé l'identification.
++      if (r === pinned || (prev !== pinned && (r.score ?? 0) > (prev.score ?? 0))) { r.queryIds = prev.queryIds; byUrl.set(key, r); rej(prev, 'duplicate_url'); } else rej(r, 'duplicate_url');
+     }
+   }
+   const merged = [...byUrl.values()];
+@@ -677,7 +689,7 @@
+   const uniq = [];
+   for (const r of merged.sort(byRankThenScore)) {
+     const k = r.domain + '|' + norm(r.title);
+-    if (seenTitle.has(k)) { rej(r, 'duplicate_title'); continue; }
++    if (seenTitle.has(k) && r !== pinned) { rej(r, 'duplicate_title'); continue; }
+     seenTitle.add(k);
+     uniq.push(r);
+   }
+@@ -690,8 +702,8 @@
+   for (const r of uniq) {
+     if (r.suspicious) { rej(r, 'suspicious_content'); continue; }
+     if (!r.content && !r.rawContent) { rej(r, 'empty_content'); continue; }
+-    if (!trusted(r) && r.score !== null && r.score < cfg.minScore) { rej(r, 'low_score'); continue; }
+-    if (!trusted(r) && !r.queryIds.some((id) => overlapsQuery(r, kwByQuery.get(id) || []))) { softRejected.push(r); continue; }
++    if (r !== pinned && !trusted(r) && r.score !== null && r.score < cfg.minScore) { rej(r, 'low_score'); continue; }
++    if (r !== pinned && !trusted(r) && !r.queryIds.some((id) => overlapsQuery(r, kwByQuery.get(id) || []))) { softRejected.push(r); continue; }
+     passed.push(r);
+   }
+   // Fail-open : un filtre lexical trop strict ne doit jamais vider tous les résultats.
+@@ -702,7 +714,10 @@
+   // 4) plafond par domaine
+   const perDomain = new Map();
+   const capped = [];
++  const pin = pinned && pool.includes(pinned) ? pinned : null;
++  if (pin) perDomain.set(pin.domain, 1); // place réservée au candidat : il compte dans le plafond sans pouvoir en être victime
+   for (const r of pool) {
++    if (r === pin) { capped.push(r); continue; }
+     const n = perDomain.get(r.domain) || 0;
+     if (n >= MAX_PER_DOMAIN) { rej(r, 'domain_cap'); continue; }
+     perDomain.set(r.domain, n + 1);
+@@ -712,6 +727,7 @@
+   // 5) sélection : chaque sous-question garde au moins son meilleur résultat
+   const picked = new Set();
+   const out = [];
++  if (pin) { picked.add(pin); out.push(pin); }
+   if (plan.length > 1) {
+     for (const it of plan) {
+       const first = capped.find((r) => r.queryIds.includes(it.id) && !picked.has(r));
+@@ -724,7 +740,13 @@
+   }
+   for (const r of capped) if (!picked.has(r)) rej(r, 'over_limit');
+ 
+-  out.sort(byRankThenScore);
++  if (pin || isIncompatible) {
++    // Identification floue : candidat confirmé d'abord, résultats explicitement incompatibles en dernier.
++    const bad = (r) => (isIncompatible && r !== pin && isIncompatible(r) ? 1 : 0);
++    out.sort((a, b) => Number(b === pin) - Number(a === pin) || bad(a) - bad(b) || byRankThenScore(a, b));
++  } else {
++    out.sort(byRankThenScore);
++  }
+   out.forEach((r, i) => { r.id = 'S' + (i + 1); });
+   return { kept: out, rejected };
+ }
+@@ -1169,6 +1191,41 @@
+   return FUZZY_CHARACTER_CONTEXT_RX.test(txt.slice(start, end));
+ }
+ 
++// Négation explicite juste avant une mention (« not a Korean film », « isn't Korean », « n'est pas un film
++// coréen »…) : un mot de négation suivi d'au plus 3 mots, dans la même proposition. Générique : s'applique au
++// géoRx de N'IMPORTE quel pays/adjectif (FUZZY_GEO_TABLE), aucun terme en dur. « not only / pas seulement »
++// n'est pas une négation. Texte déjà normalisé par norm() (minuscule, sans accents).
++const FUZZY_NEGATED_LEAD_RX = /\b(?:not|isn['’]t|wasn['’]t|aren['’]t|weren['’]t|n['’]est\s+pas|n['’]etait\s+pas|ne\s+sont\s+pas|pas)\b(?!\s+(?:only|just|merely|simply|seulement|uniquement)\b)(?:\s+[^\s.!?;,:()]+){0,3}\s*$/;
++
++function geoMentionIsNegated(txt, idx) {
++  const lead = txt.slice(Math.max(0, idx - 48), idx);
++  const cut = Math.max(...['.', '!', '?', ';', ',', ':'].map((c) => lead.lastIndexOf(c)));
++  return FUZZY_NEGATED_LEAD_RX.test(lead.slice(cut + 1));
++}
++
++/** true si le résultat CONTREDIT explicitement la contrainte géographique demandée : au moins une mention
++ *  du pays/adjectif est niée ET aucune n'est affirmée (« Not a Korean film »). Une mention affirmée
++ *  ailleurs dans le texte suffit à ne PAS conclure à une contradiction (prudent : pas de faux rejet). */
++function resultContradictsGeo(r, fuzzyCtx) {
++  if (!fuzzyCtx || !fuzzyCtx.geoRx) return false;
++  const txt = fuzzyResultText(r);
++  const rx = new RegExp(fuzzyCtx.geoRx.source, 'gi');
++  let negated = 0;
++  let affirmed = 0;
++  let m;
++  while ((m = rx.exec(txt))) {
++    if (!m[0].length) { rx.lastIndex++; continue; }
++    if (geoMentionIsNegated(txt, m.index)) negated++; else affirmed++;
++  }
++  return negated > 0 && affirmed === 0;
++}
++
++/** Résultat explicitement incompatible avec la période (année hors période, voir fuzzyYearConsistency) ou
++ *  avec la contrainte géographique. Sert à ne jamais en faire le résultat principal. */
++function fuzzyResultIsIncompatible(r, fuzzyCtx) {
++  return resultContradictsGeo(r, fuzzyCtx) || (!!fuzzyCtx.time && fuzzyYearConsistency(r, fuzzyCtx.time) === -1);
++}
++
+ /** Un résultat n'est "pertinent" que s'il recoupe les indices OBLIGATOIRES fournis (géo, noms propres,
+  *  format), avec de vraies frontières de mot pour les noms : "Robin" ne doit jamais être considéré
+  *  comme présent dans "Robinson" (voir nameBoundaryRx) — et un nom doit avoir un rôle central, pas
+@@ -1178,6 +1235,7 @@
+   const txt = fuzzyResultText(r);
+   if (txt.trim().length < 40) return false; // trop pauvre/générique pour confirmer quoi que ce soit
+   if (fuzzyCtx.geoRx && !fuzzyCtx.geoRx.test(txt)) return false;
++  if (resultContradictsGeo(r, fuzzyCtx)) return false; // « Not a Korean film » ne recoupe pas « film coréen »
+   if (resultFormatConflicts(r, fuzzyCtx)) return false;
+   if (fuzzyCtx.names.length && !fuzzyCtx.names.some((n) => nameIsCentral(r, n))) return false;
+   return true;
+@@ -1440,17 +1498,20 @@
+     // Identification floue détectée, mais le 1er passage recoupe déjà les indices (obligatoires ET
+     // extras) : aucune requête Tavily supplémentaire. `triggered` reflète la détection, pas le nombre
+     // de requêtes envoyées.
+-    return { items: [], runs: [], meta: { triggered: true, attempts: 0, finalOk: true, onTopic: verdict.onTopic, candidateTitle: verdict.candidate ? verdict.candidate.title : null } };
++    return { items: [], runs: [], candidate: verdict.ok ? (verdict.candidate || null) : null, meta: { triggered: true, attempts: 0, finalOk: true, onTopic: verdict.onTopic, candidateTitle: verdict.candidate ? verdict.candidate.title : null } };
+   }
+ 
+   const callsUsed = runs.reduce((n, r) => n + r.info.attempts, 0);
+   let budget = FUZZY_MAX_TAVILY_CALLS - callsUsed;
+   if (budget <= 0) {
+     log.debug('fuzzy.budget_exhausted', { callsUsed });
+-    return { items: [], runs: [], meta: { triggered: true, attempts: 0, finalOk: verdict.ok, onTopic: verdict.onTopic, candidateTitle: verdict.candidate ? verdict.candidate.title : null } };
++    return { items: [], runs: [], candidate: verdict.ok ? (verdict.candidate || null) : null, meta: { triggered: true, attempts: 0, finalOk: verdict.ok, onTopic: verdict.onTopic, candidateTitle: verdict.candidate ? verdict.candidate.title : null } };
+   }
+ 
++  // La requête réellement exécutée (Q1) peut différer de `original` quand elle a été réécrite : les deux
++  // comptent comme « déjà essayées », sans quoi une Q2 identique à Q1 passerait pour nouvelle.
+   const tried = [initialItem.original];
++  if (initialItem.query && norm(initialItem.query) !== norm(initialItem.original)) tried.push(initialItem.query);
+   const pool = initialResults.slice();
+   const items = [];
+   const newRuns = [];
+@@ -1502,6 +1563,10 @@
+ 
+   return {
+     items, runs: newRuns,
++    // Candidat CONFIRMÉ uniquement (verdict.ok === true) : objet résultat (avec l'extrait qui a confirmé), transmis à
++    // processResults pour être épinglé. Un candidat encore incertain (ok === false) n'est jamais épinglé ni promu en S1.
++    // Jamais exposé au frontend (hors de `meta`).
++    candidate: verdict.ok ? (verdict.candidate || null) : null,
+     meta: {
+       triggered: true, attempts: items.length, finalOk: verdict.ok, onTopic: verdict.onTopic,
+       candidateTitle: verdict.candidate ? verdict.candidate.title : null,
+@@ -1772,6 +1837,7 @@
+     // en sous-questions, ni à une question précise (detectFuzzyIdentification renvoie alors null) —
+     // le comportement à une seule requête Tavily reste inchangé dans tous les autres cas.
+     let fuzzyInfo = null;
++    let fuzzyRender = null; // { pinned, isIncompatible } pour processResults — null hors identification floue
+     if (plan.length === 1) {
+       const fuzzyCtx = detectFuzzyIdentification(message, options.contextHint, options.historyHint);
+       if (fuzzyCtx) {
+@@ -1782,6 +1848,7 @@
+           plan = plan.concat(extension.items);
+           runs = runs.concat(extension.runs);
+           fuzzyInfo = extension.meta;
++          fuzzyRender = { pinned: extension.candidate || null, isIncompatible: (r) => fuzzyResultIsIncompatible(r, fuzzyCtx) };
+         }
+       }
+     }
+@@ -1792,7 +1859,7 @@
+     const okRuns = runs.filter((r) => r.info.status === 'ok');
+     const errors = runs.filter((r) => r.info.error).map((r) => r.info.error);
+     const retrieved = okRuns.reduce((n, r) => n + r.results.length, 0);
+-    const { kept, rejected } = processResults(okRuns.map((r) => ({ item: r.item, results: r.results })), plan, cfg);
++    const { kept, rejected } = processResults(okRuns.map((r) => ({ item: r.item, results: r.results })), plan, cfg, fuzzyRender || undefined);
+     // Anti-hallucination : classe chaque résultat conservé (voir section 8ter) et injecte une réserve
+     // dans son extrait si la corroboration est insuffisante ou si l'identification floue n'a jamais abouti.
+     annotateCorroboration(kept, { forceUnverifiable: !!(fuzzyInfo && fuzzyInfo.triggered && !fuzzyInfo.finalOk) });
+@@ -1899,7 +1966,7 @@
+     extractNegatedClues, extractAxisMatches, extractSpokenLanguage, pickActiveGeo, extraAxesFor,
+     FUZZY_GEO_TABLE, FUZZY_FORMAT_TABLE, FUZZY_ROLE_TABLE, FUZZY_LANGUAGE_TABLE, FUZZY_GENRE_TABLE,
+     buildFuzzyVerification, resultMatchesClues, confirmedExtras, nameBoundaryRx, detectTimePeriod, nameIsCentral,
+-    clusterRelevantResults, scoreFuzzyResult,
++    clusterRelevantResults, scoreFuzzyResult, resultContradictsGeo, fuzzyResultIsIncompatible,
+   },
+ };
+ 
